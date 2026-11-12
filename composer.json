@@ -1,0 +1,56 @@
+{
+    "name": "camaleaun/wp-cli-eject-command",
+    "description": "WP-CLI command that verifies a downloaded WordPress site against wordpress.org checksums, ejects what can be downloaded again, packs the rest and writes a Playground blueprint that rebuilds it.",
+    "type": "wp-cli-package",
+    "license": "MIT",
+    "require": {
+        "php": ">=7.4",
+        "ext-zip": "*",
+        "wp-cli/wp-cli": "^2.11 || ^3"
+    },
+    "require-dev": {
+        "wp-cli/core-command": "^3",
+        "wp-cli/extension-command": "^2 || ^3",
+        "wp-cli/wp-cli-tests": "^5"
+    },
+    "autoload": {
+        "psr-4": {
+            "Camaleaun\\Eject\\": "src/"
+        },
+        "files": [
+            "eject-command.php"
+        ]
+    },
+    "scripts": {
+        "behat": "run-behat-tests",
+        "behat-rerun": "rerun-behat-tests",
+        "lint": "run-linter-tests",
+        "lint-gherkin": "run-gherkin-lint-tests",
+        "phpcs": "run-phpcs-tests",
+        "phpcbf": "run-phpcbf-cleanup",
+        "prepare-tests": "install-package-tests",
+        "test": [
+            "@lint",
+            "@lint-gherkin",
+            "@phpcs",
+            "@behat"
+        ]
+    },
+    "config": {
+        "process-timeout": 7200,
+        "sort-packages": true,
+        "allow-plugins": {
+            "dealerdirect/phpcodesniffer-composer-installer": true,
+            "johnpbloch/wordpress-core-installer": true,
+            "phpstan/extension-installer": true
+        },
+        "lock": false
+    },
+    "extra": {
+        "commands": [
+            "eject"
+        ]
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true
+}

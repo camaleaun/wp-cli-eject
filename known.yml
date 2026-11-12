@@ -1,0 +1,37 @@
+# =============================================================================
+# KNOWN DIFFERENCES
+# =============================================================================
+# Differences wp eject knows are not changes to a package's code:
+#
+#   modified: files that differ from wordpress.org but are not code changes. They
+#             count as verified (as if unmodified).
+#   added:    files a package writes at runtime. They are not warnings, not
+#             bundled, and listed in deploy/deployignore so a deploy never
+#             deletes them on the server.
+#
+# Each entry matches one package:
+#   plugin: <slug> | theme: <slug> | core: true | package: '*' (any plugin or theme)
+#   version: Composer-like constraint: '*', '>=2.5', '>=1.0 <2.0', '^7.0', '~1.2',
+#            '1.0 - 2.0', joined with '||' for alternatives
+#   files are globs relative to the package folder (* also matches /).
+#
+# Add your own with `wp eject --known=<file>` (same format).
+# =============================================================================
+
+# Nested git repositories shipped inside a package: tools that scan nested
+# repositories (VS Code, git status run in that folder) rewrite their index's
+# stat cache; the tracked files and blob hashes stay the same.
+- package: '*'
+  version: '*'
+  modified:
+    - '*/.git/index'
+    - '.git/index'
+  reason: git index of a nested repository; only its stat cache changes
+
+# All-in-One WP Migration protects its export storage with files it writes on
+# first run.
+- plugin: all-in-one-wp-migration
+  version: '*'
+  added:
+    - storage/*
+  reason: runtime files All-in-One WP Migration writes to protect its storage

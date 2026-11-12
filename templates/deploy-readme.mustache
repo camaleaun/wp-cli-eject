@@ -1,0 +1,255 @@
+{{! TODO: no visible credit and no 'generated' text on purpose, see Pipeline::is_generated() (src/Pipeline.php): an option may add one back. }}
+# Deploy
+
+Pushes to `{{{branch}}}` rebuild the site from `blueprint.json` and deploy it to **production** over SSH.
+Pushes to `{{{staging_branch}}}` deploy to **staging**. Pull requests only build, to prove the blueprint works.
+Only code is deployed: the database, uploads and `wp-config.php` stay on the server.
+Along the way it handles maintenance mode, backups, commands after the deploy and Slack.
+
+| File | What it is |
+|---|---|
+| `blueprint.json` | the site's code: core, plugins and themes at exact versions, plus the repository's own code |
+| `deploy/deploy.php` | the commands `build`, `deploy`, `full`, `maintenance`, `restore` and `vendor`. Do not edit it |
+| `deploy/config.yml` | **your settings.** Never overwritten |
+| `deploy/deployignore` | paths never built, deployed or deleted on the server. Yours: edit freely |
+| `{{{ci_file}}}` | the {{{provider_name}}} pipeline |
+
+## Set it up
+
+### 1. Give the pipeline access to the server
+
+{{#bitbucket}}
+Best: *Repository settings > Pipelines > SSH keys*. Generate a key pair (or add yours), put the
+public key in the server's `~/.ssh/authorized_keys`, and add the server under *Known hosts*.
+`deploy` finds the key by itself. Other ways: `SSH_PRIVATE_KEY` (secured variable) or `SSH_KEY_PATH`.
+
+Then, in *Repository settings > Deployments*, for **Production** and **Staging**:
+
+| Variable | Example |
+|---|---|
+| `SSH_HOST` | `203.0.113.10` |
+| `SSH_USER` | `deploy` |
+| `DEPLOY_PATH` | `/home/deploy/public_html` |
+| `SSH_PORT` (optional) | `22` |
+| `SSH_KNOWN_HOSTS` (optional) | output of `ssh-keyscan your-server` |
+| `SLACK_WEBHOOK_URL` (optional, secured) | `https://hooks.slack.com/services/...` |
+{{/bitbucket}}
+{{#github}}
+In *Settings > Environments*, create **production** and **staging**, each with:
+
+| Kind | Name | Example |
+|---|---|---|
+| secret | `SSH_PRIVATE_KEY` | the private key; its public key is in the server's `~/.ssh/authorized_keys` |
+| secret (optional) | `SSH_KNOWN_HOSTS` | output of `ssh-keyscan your-server` |
+| secret (optional) | `SLACK_WEBHOOK_URL` | `https://hooks.slack.com/services/...` |
+| variable | `SSH_HOST` | `203.0.113.10` |
+| variable | `SSH_USER` | `deploy` |
+| variable | `DEPLOY_PATH` | `/home/deploy/public_html` |
+| variable (optional) | `SSH_PORT`, `DEPLOY_DELETE`, `DEPLOY_STRATEGY` | `22`, `packages`, `tarball` |
+{{/github}}
+{{#gitlab}}
+In *Settings > CI/CD > Variables*, add these for the **production** and **staging** environments:
+
+| Variable | Example |
+|---|---|
+| `SSH_PRIVATE_KEY` (masked) | the private key; its public key is in the server's `~/.ssh/authorized_keys` |
+| `SSH_HOST` | `203.0.113.10` |
+| `SSH_USER` | `deploy` |
+| `DEPLOY_PATH` | `/home/deploy/public_html` |
+| `SSH_PORT`, `SSH_KNOWN_HOSTS`, `DEPLOY_DELETE`, `DEPLOY_STRATEGY`, `SLACK_WEBHOOK_URL` (optional) | |
+{{/gitlab}}
+
+Without `SSH_KNOWN_HOSTS`, the server's key is trusted on first use.
+
+**Staging on another server:** give it its own host, user, key and path{{#github}} in the *staging* environment{{/github}}{{#gitlab}} scoped to *staging*{{/gitlab}}{{#bitbucket}} in the *Staging* deployment, or as repository variables `STAGING_SSH_HOST`, `STAGING_SSH_USER`, `STAGING_SSH_PRIVATE_KEY` and `STAGING_DEPLOY_PATH`{{/bitbucket}}. Staging on the same server, in another folder, only needs the path: `STAGING_DEPLOY_PATH`, or `environments.staging.path` in `deploy/config.yml`. Each `STAGING_` variable falls back to the production one.
+
+### 2. Check `deploy/config.yml`
+
+Look at `deploy.delete`, `deploy.paths`, `deploy.maintenance`, `deploy.backup` and `deploy.after`.
+Each one is explained in the file.
+
+### 3. Try it first
+
+```bash
+wp --require=deploy/deploy.php build
+wp --require=deploy/deploy.php deploy --to=/tmp/server-copy                  # a local folder
+SSH_HOST=... SSH_USER=... wp --require=deploy/deploy.php deploy --to=/home/deploy/public_html --dry-run
+```
+
+Read every `*deleting` line of the dry run before deploying for real.
+
+### 4. Push
+
+A push to `{{{branch}}}` deploys to production. A push to `{{{staging_branch}}}` deploys to staging.
+Manual runs: {{#github}}*Actions > Deploy > Run workflow* (deploy, build-only, maintenance-on, maintenance-off, per environment){{/github}}{{#gitlab}}the play buttons of the `maintenance-*` jobs in a pipeline of `{{{branch}}}` or `{{{staging_branch}}}`; *Build > Pipelines > Run pipeline* builds and deploys again{{/gitlab}}{{#bitbucket}}*Pipelines > Run pipeline > custom*: `deploy-production`, `deploy-staging`, `build-only`, `maintenance-on-production`, `maintenance-off-production`, `maintenance-on-staging`, `maintenance-off-staging`{{/bitbucket}}.
+
+## Commands
+
+```bash
+wp --require=deploy/deploy.php build [--keep-snapshot]
+wp --require=deploy/deploy.php deploy [--env=<env>] [--to=<path>] [--delete=<mode>] [--strategy=<strategy>] [--no-maintenance] [--dry-run]
+wp --require=deploy/deploy.php full [--env=<env>]          # build, then deploy
+wp --require=deploy/deploy.php deploy status [--env=<env>] # which commit is on the target
+wp --require=deploy/deploy.php maintenance <on|off> [--env=<env>]
+wp --require=deploy/deploy.php restore                     # put the site's code back in this folder
+wp --require=deploy/deploy.php vendor publish [--no-push]  # external packages -> branches + tags
+wp --require=deploy/deploy.php vendor list
+wp --require=deploy/deploy.php help deploy
+```
+
+By hand, from your computer:
+
+```bash
+export SSH_HOST=your-server.com SSH_USER=username SSH_KEY_PATH=~/.ssh/id_ed25519 DEPLOY_PATH=/home/user/public_html
+wp --require=deploy/deploy.php full --env=production
+```
+
+`deploy` runs: maintenance on, backup (if enabled), copy, `deploy.after`, maintenance off.
+If a step fails, maintenance still goes off and Slack is told.
+
+`build` needs Node.js (`npx`). `deploy` needs `ssh` and `rsync` or `tar`. A missing tool is reported with what to install.
+
+**Where the build is made:** `--build-dir`, `BUILD_DIR` or `build.dir` in `deploy/config.yml`. By default it is a
+folder in the system temp directory, outside the repository. `.` builds in the temp folder and merges the result
+into the repository root (this is what `restore` does). `build` will not wipe a folder you chose unless it is a
+previous build. The CI sets `BUILD_DIR=build`, the artifact between its jobs.
+
+## Settings
+
+Precedence: command option > environment variable > `deploy/config.yml` > default.
+
+| Variable | Option | `config.yml` | |
+|---|---|---|---|
+| `DEPLOY_ENV` | `--env` | | `production` (default), `staging`… |
+| `DEPLOY_PATH` | `--to` | `environments.<env>.path` | WordPress root on the server (a local folder if `SSH_HOST` is empty) |
+| `DEPLOY_DELETE` | `--delete` | `deploy.delete` | see below |
+| `DEPLOY_STRATEGY` | `--strategy` | `deploy.strategy` | `auto`, `rsync` or `tarball` |
+| | `--[no-]maintenance` | `deploy.maintenance` | maintenance mode during the deploy |
+| `DRY_RUN=1` | `--dry-run` | | change nothing, list what would change |
+| `SSH_HOST`, `SSH_USER`, `SSH_PORT` | | | the server |
+| `SSH_PRIVATE_KEY`, `SSH_KEY_PATH`, `SSH_KNOWN_HOSTS` | | | the key and the server's host key |
+| `SLACK_WEBHOOK_URL` | | `notify.slack_webhook` | notifications |
+| `PLAYGROUND_CLI` | | | another Playground CLI for `build` (default `@wp-playground/cli@{{{playground_version}}}`) |
+
+For an environment other than production, each variable is read with its prefix first:
+`--env=staging` reads `STAGING_SSH_HOST`, then `SSH_HOST`.
+
+### What may be deleted on the server: `deploy.delete`
+
+| Mode | Deletes | Use it when |
+|---|---|---|
+| `mirror` | everything not in the build, except `deployignore` | the repository is the whole truth for the code |
+| `packages` | only inside each plugin, theme and core folder of the build | the server has plugins the repository does not |
+| `none` | nothing: only adds and updates | first deploys, or when unsure |
+
+`mirror` also deletes files that exist only on the server (search engine verification files, server
+mu-plugins, cache drop-ins). Add them to `deploy/deployignore` first.
+
+### How files are copied: `deploy.strategy`
+
+- `auto` (default): one tarball when the target is empty (nothing to compare or delete), incremental rsync after that.
+- `rsync`: always incremental. Needs rsync on the runner and the server.
+- `tarball`: one `.tar.gz` copied with `scp` and extracted on the server. For hosts without rsync. It cannot `mirror`.
+  With `delete: packages` it removes each plugin, theme and core folder it ships before extracting, so anything
+  inside those folders that exists only on the server is lost (use `rsync` or `none` if that matters).
+  `auto` only uses a tarball on an empty target, so it never hits this.
+
+### What to deploy: `deploy.paths`
+
+| Deploy | `deploy.paths` |
+|---|---|
+| everything the build has, core included (default) | empty |
+| themes and plugins | `wp-content/themes`, `wp-content/plugins` |
+| one theme | `wp-content/themes/<name>` |
+| all of `wp-content` | `wp-content` |
+
+```yaml
+deploy:
+  paths:
+    - wp-content/themes
+    - wp-content/plugins
+    - wp-content/mu-plugins
+```
+
+Uploads are never deployed. Deploying everything is bigger and slower, and can overwrite what only exists on
+the server: keep it for the first setup, a migration or a core update. Hosts that manage WordPress core only
+need `wp-content`.
+
+### Maintenance mode
+
+`deploy` turns maintenance on before copying and off at the end, with `wp maintenance-mode` on the server or
+WordPress' `.maintenance` file when the server has no WP-CLI. WordPress ends it by itself after 10 minutes.
+For your own page, add `wp-content/maintenance.php`. A list of allowed IPs is not possible: WordPress ends the request right after the template. Turn it off with `deploy.maintenance: false` or
+`--no-maintenance`, or by hand with `maintenance on|off`.
+
+### Backups
+
+With `deploy.backup.enabled: true`, each deploy first saves the server's `wp-content` (without uploads, cache and
+upgrade) to `deploy.backup.path/wp-content_<date>.tar.gz` and keeps the last `deploy.backup.keep`. The default
+path, `~/deploy-backups`, is in the SSH user's home, outside the web root.
+
+### Build commands and patches: `build.commands`
+
+They run after the code is assembled, each inside `build/<path>`. `DEPLOY_ROOT` is the repository root:
+
+```yaml
+build:
+  commands:
+    - path: wp-content/themes/acme-child
+      run: npm ci && npm run build
+    - path: wp-content/plugins/woocommerce
+      run: patch -p1 < "$DEPLOY_ROOT/patches/woocommerce-fix.patch"
+```
+
+A patch that no longer applies fails the build. That is what you want.
+
+### After the deploy: `deploy.after`
+
+Commands run on the server, in the WordPress root, after the files are copied:
+
+```yaml
+deploy:
+  after:
+    - wp cache flush
+    - wp rewrite flush
+```
+
+### Which commit is deployed: `.git-ftp.log`
+
+Each deploy writes the commit it shipped to `.git-ftp.log` in the target's WordPress root. It is the same file
+[git-ftp](https://github.com/git-ftp/git-ftp) uses, so you can switch between the two tools.
+
+```bash
+wp --require=deploy/deploy.php deploy status --env=production
+# Deployed to production: 0a28e39...   /   HEAD is deployed.  (or: 3 commit(s) behind HEAD.)
+```
+
+### `deploy/deployignore`
+
+rsync patterns, from the WordPress root (`/wp-config.php`, `/wp-content/uploads/`) or anywhere (`*.log`). A matching
+path is not copied into the build, not deployed, and **not deleted on the server**, even with `mirror`.
+Already listed: `wp-config.php`, `.htaccess`, `.maintenance`, `.git-ftp.log`, uploads, caches, backups, `.env`,
+dumps, logs, editor files and `node_modules`.
+
+## External packages
+
+Packages that are not in wordpress.org live on their own branches, with one tag per version (see
+[README.md](../README.md#external-packages)). `build` turns the tags the blueprint needs into zips.
+`vendor publish` creates them from a folder or zip in `vendor/` or `wp-content/`, without switching branch or
+touching your working tree. A published version never changes: publishing it again with other files is an error.
+
+## Problems
+
+| You see | Fix |
+|---|---|
+| `Cannot deploy:` and a list | everything missing is listed: set those variables or `deploy/config.yml` entries |
+| `Permission denied (publickey)` | the public key is not in the server user's `~/.ssh/authorized_keys`, or the key variable lost its line breaks |
+| `SSH_PRIVATE_KEY does not look like a private key` | paste the whole key, `-----BEGIN ...-----` included |
+| `Host key verification failed` | set `SSH_KNOWN_HOSTS` to the output of `ssh-keyscan -p <port> <host>` |
+| `Missing external packages` or `no tag vendor/...` | an external package was never published: run `vendor publish` where its folder or zip is |
+| `build-snapshot` fails on a step | a plugin URL or zip in `blueprint.json` is wrong or gone. The tool's output is printed when it fails; add `--debug` to see it live |
+| lots of `Deprecated:` lines from `phar://.../composer` | the WP-CLI phar bundles an old Composer that PHP 8.4 complains about. Harmless: run with `php -d error_reporting='E_ALL & ~E_DEPRECATED' $(which wp) ...` |
+| `A command was not found (127)` | install the tool it names (rsync, scp, tar, npx), or use `strategy: tarball` |
+| `Warning: no wp (WP-CLI) on the target` | `deploy.after` needs WP-CLI on the server; maintenance mode works without it |
+| the site stayed in maintenance | the deploy was killed: run `maintenance off --env=<env>`. WordPress also ends it after 10 minutes |
+| something on the server disappeared | it was not in `deployignore` and `deploy.delete` was `mirror`: add it there, or use `packages` |

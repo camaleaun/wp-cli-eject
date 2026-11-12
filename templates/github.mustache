@@ -1,0 +1,169 @@
+{{=<% %>=}}
+<%! TODO: no visible credit and no 'generated' text on purpose, see Pipeline::is_generated() (src/Pipeline.php): an option may add one back. %>
+# =============================================================================
+# GITHUB ACTIONS - WORDPRESS DEPLOYMENT
+# =============================================================================
+# The site's code is rebuilt from blueprint.json (WordPress Playground) and
+# deployed over SSH by WP-CLI commands in deploy/deploy.php (see deploy/README.md):
+#   - wp --require=deploy/deploy.php build        : blueprint -> build/ (+ the repository's own code)
+#   - wp --require=deploy/deploy.php deploy       : build/ -> server (maintenance, backup, after commands)
+#   - wp --require=deploy/deploy.php maintenance  : maintenance mode on/off
+# Settings: deploy/config.yml. Never deployed nor deleted: deploy/deployignore.
+#
+# Settings > Environments > production / staging:
+#   - secret   SSH_PRIVATE_KEY (and optionally SSH_KNOWN_HOSTS, SLACK_WEBHOOK_URL)
+#   - variable SSH_HOST, SSH_USER, DEPLOY_PATH (and optionally SSH_PORT, DEPLOY_DELETE, DEPLOY_STRATEGY)
+# =============================================================================
+name: Deploy
+
+# =============================================================================
+# TRIGGERS
+# =============================================================================
+on:
+  # <%& branch %> -> production, <%& staging_branch %> -> staging
+  push:
+    branches:
+      - <%& branch %>
+      - <%& staging_branch %>
+
+  # Build & Validate (no deployment)
+  pull_request:
+
+  # Manual runs (Actions > Deploy > Run workflow)
+  workflow_dispatch:
+    inputs:
+      action:
+        description: What to run
+        type: choice
+        default: deploy
+        options:
+          - deploy
+          - build-only
+          - maintenance-on
+          - maintenance-off
+      environment:
+        description: Environment
+        type: choice
+        default: production
+        options:
+          - production
+          - staging
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The artifact between the jobs is build/ (a local build lives outside the repository)
+  BUILD_DIR: build
+  # production for <%& branch %>, staging for <%& staging_branch %>, or the manual choice
+  DEPLOY_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || (github.ref_name == '<%& staging_branch %>' && 'staging' || 'production') }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # BUILD
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build from the blueprint
+    if: github.event_name != 'workflow_dispatch' || !startsWith(inputs.action, 'maintenance')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rsync is not guaranteed on the runner image
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq rsync openssh-client > /dev/null
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: '8.3'
+          extensions: zip
+          tools: wp-cli
+          coverage: none
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      # Cache npx downloads (WordPress Playground CLI)
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.npm
+          key: npm-${{ hashFiles('deploy/deploy.php') }}
+
+      # Rebuild the site's code into build/
+      - run: wp --require=deploy/deploy.php build
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build
+          path: build/
+          include-hidden-files: true
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # DEPLOY (production or staging)
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to ${{ github.event_name == 'workflow_dispatch' && inputs.environment || (github.ref_name == '<%& staging_branch %>' && 'staging' || 'production') }}
+    needs: build
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action == 'deploy')
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || (github.ref_name == '<%& staging_branch %>' && 'staging' || 'production') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # rsync is not guaranteed on the runner image
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq rsync openssh-client > /dev/null
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: build
+          path: build/
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: '8.3'
+          extensions: zip
+          tools: wp-cli
+          coverage: none
+
+      # Run deployment
+      - run: wp --require=deploy/deploy.php deploy --env="$DEPLOY_ENV"
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_USER: ${{ vars.SSH_USER }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+          DEPLOY_DELETE: ${{ vars.DEPLOY_DELETE }}
+          DEPLOY_STRATEGY: ${{ vars.DEPLOY_STRATEGY }}
+
+  # ---------------------------------------------------------------------------
+  # MAINTENANCE MODE (manual)
+  # ---------------------------------------------------------------------------
+  maintenance:
+    name: Maintenance mode ${{ inputs.action == 'maintenance-on' && 'on' || 'off' }} (${{ inputs.environment }})
+    if: github.event_name == 'workflow_dispatch' && startsWith(inputs.action, 'maintenance')
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq openssh-client > /dev/null
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: '8.3'
+          tools: wp-cli
+          coverage: none
+
+      - run: wp --require=deploy/deploy.php maintenance ${{ inputs.action == 'maintenance-on' && 'on' || 'off' }} --env="$DEPLOY_ENV"
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_USER: ${{ vars.SSH_USER }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}

@@ -1,0 +1,16 @@
+name: Testing
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '17 3 * * 1' # Weekly: the tests talk to the live wordpress.org APIs.
+
+jobs:
+  test:
+    uses: wp-cli/.github/.github/workflows/reusable-testing.yml@main
+    with:
+      minimum-php: '7.4' # composer.json requires php >=7.4

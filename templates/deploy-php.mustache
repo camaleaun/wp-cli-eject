@@ -1,0 +1,1598 @@
+{{! TODO: no visible credit and no 'generated' text on purpose, see Pipeline::is_generated() (src/Pipeline.php): an option may add one back. }}
+<?php
+/**
+ * Builds the site's code from blueprint.json and deploys it. WP-CLI commands
+ * that run without WordPress or a database:
+ *
+ *     wp --require=deploy/deploy.php build
+ *     wp --require=deploy/deploy.php deploy [--env=<env>] [--to=<path>] [--dry-run]
+ *     wp --require=deploy/deploy.php full [--env=<env>]
+ *     wp --require=deploy/deploy.php maintenance <on|off> [--env=<env>]
+ *     wp --require=deploy/deploy.php vendor publish|fetch|list
+ *     wp --require=deploy/deploy.php restore
+ *
+ * Settings: deploy/config.yml (yours, never overwritten). Order of precedence:
+ * command option > environment variable > deploy/config.yml > default.
+ * Self-contained: it needs no other package. See deploy/README.md.
+ *
+ * Needs PHP with zip, WP-CLI, Node.js (npx) for the build, and rsync (plus ssh
+ * for a remote deploy; scp and tar for the tarball strategy).
+ */
+
+// A file of the site's repository, not a plugin: no prefix rules for its globals.
+// phpcs:disable WordPress.NamingConventions.PrefixAllGlobals
+
+if ( ! class_exists( 'WP_CLI' ) ) {
+	return;
+}
+
+if ( ! class_exists( 'CI_Deploy_Command' ) ) {
+
+	/**
+	 * Builds the site's code from the blueprint and deploys it.
+	 */
+	class CI_Deploy_Command {
+
+		/** Playground CLI used by `build` (override with the PLAYGROUND_CLI variable). */
+		const PLAYGROUND_VERSION = '{{{playground_version}}}';
+
+		/** Where the external zips go for the build (the blueprint's "bundled" paths). */
+		const VENDOR_PATH = '{{{vendor_path}}}';
+
+		/** Each external package: orphan branch vendor/<type>/<slug>, one tag vendor/<type>/<slug>/<version> per version. */
+		const VENDOR_REF = 'vendor';
+
+		const DELETE_MODES = array( 'mirror', 'packages', 'none' );
+
+		const STRATEGIES = array( 'auto', 'rsync', 'tarball' );
+
+		/** Used when deploy/config.yml does not set a value. */
+		const DEFAULTS = array(
+			'build'        => array(
+				'dir'      => '',
+				'commands' => array(),
+			),
+			'deploy'       => array(
+				'delete'      => '{{{deploy_delete}}}',
+				'strategy'    => 'auto',
+				'paths'       => array(),
+				'maintenance' => true,
+				'backup'      => array(
+					'enabled' => false,
+					'keep'    => 5,
+					'path'    => '~/deploy-backups',
+				),
+				'after'       => array(),
+			),
+			'environments' => array(),
+			'notify'       => array( 'slack_webhook' => '' ),
+		);
+
+		/** @var string Repository root (the folder that holds deploy/). */
+		private $root;
+
+		/** @var string Absolute path of the build directory (outside the repository by default). */
+		private $build = '';
+
+		/** @var bool `--build-dir=.`: the build is merged into the repository root afterwards. */
+		private $into_root = false;
+
+		/** @var bool The build directory is the temp folder we choose ourselves (safe to wipe). */
+		private $build_is_default = true;
+
+		/** @var array Settings from deploy/config.yml merged over DEFAULTS. */
+		private $config;
+
+		/** @var string Environment being deployed (production, staging…). */
+		private $env = 'production';
+
+		/** @var string WordPress root on the target. */
+		private $path = '';
+
+		/** @var string SSH host, or '' for a local folder. */
+		private $host = '';
+
+		/** @var string user@host or host. */
+		private $login = '';
+
+		/** @var string[] ssh command and options. */
+		private $ssh = array();
+
+		/** @var string[] scp command and options. */
+		private $scp = array();
+
+		/** @var string|null Temporary key file written from SSH_PRIVATE_KEY. */
+		private $temp_key = null;
+
+		/** @var bool Maintenance mode was turned on by this run and must be turned off. */
+		private $in_maintenance = false;
+
+		/** @var bool The deploy finished. */
+		private $done = false;
+
+		/**
+		 * @param string|null $root Repository root; default: the folder above deploy/.
+		 */
+		public function __construct( $root = null ) {
+			$this->root   = $root ? rtrim( $root, '/' ) : dirname( __DIR__ );
+			$this->config = self::DEFAULTS;
+			$file         = $this->root . '/deploy/config.yml';
+			if ( is_file( $file ) ) {
+				$parser = class_exists( 'Mustangostang\\Spyc' ) ? 'Mustangostang\\Spyc' : 'Spyc';
+				$loaded = call_user_func( array( $parser, 'YAMLLoad' ), $file );
+				if ( is_array( $loaded ) ) {
+					$this->config = array_replace_recursive( $this->config, $loaded );
+				}
+			}
+		}
+
+		/**
+		 * Rebuild the site's code into build/ from blueprint.json.
+		 *
+		 * Puts the external zips in place (`vendor fetch`: from vendor/, wp-content/
+		 * or their tags), builds a WordPress Playground snapshot of the
+		 * blueprint, drops what only exists for Playground (its wp-config.php and
+		 * SQLite), lays the repository's own wp-content over it (minus
+		 * deploy/deployignore), then runs build.commands from deploy/config.yml.
+		 *
+		 * ## OPTIONS
+		 *
+		 * [--build-dir=<path>]
+		 * : Where to build (BUILD_DIR, build.dir in deploy/config.yml). Default: a folder in the system temp directory, outside the repository. A relative path is relative to the repository; `.` builds in the temp directory and merges the result into the repository root (what `restore` does).
+		 *
+		 * [--keep-snapshot]
+		 * : Keep the Playground snapshot (<build dir>.zip) next to the build.
+		 *
+		 * [--keep-build]
+		 * : With --build-dir=. : keep the build directory after merging it.
+		 *
+		 * ## EXAMPLES
+		 *
+		 *     $ wp --require=deploy/deploy.php build
+		 *     $ wp --require=deploy/deploy.php build --build-dir=build
+		 *
+		 * @when before_wp_load
+		 */
+		public function build( $args, $assoc_args ) {
+			$this->make_build( $assoc_args, true );
+			if ( $this->into_root ) {
+				$this->merge_into_root( $assoc_args );
+			}
+		}
+
+		/** Builds the site's code into the build directory. */
+		private function make_build( $assoc_args, $allow_root ) {
+			chdir( $this->root );
+			$this->resolve_build( $assoc_args, $allow_root );
+			if ( ! is_file( 'blueprint.json' ) ) {
+				WP_CLI::error( "No blueprint.json in {$this->root}." );
+			}
+			self::need( 'npx', 'the build runs the WordPress Playground CLI with it (it comes with Node.js)' );
+			if ( is_dir( 'wp-content' ) ) {
+				self::need( 'rsync', "it lays the repository's own code over the build" );
+			}
+
+			self::step( 'Build' );
+			$this->vendor_fetch( array(), array() );
+
+			$this->check_build_dir();
+			self::remove( $this->build );
+			self::remove( $this->build . '.zip' );
+
+			// Playground reads the blueprint's folder into memory: build from a folder
+			// with only blueprint.json and the files it references, not the whole
+			// repository (.git, archives…), or it runs out of space.
+			$stage = $this->stage_blueprint();
+			$cli   = getenv( 'PLAYGROUND_CLI' ) ? getenv( 'PLAYGROUND_CLI' ) : '@wp-playground/cli@' . self::PLAYGROUND_VERSION;
+			WP_CLI::log( "Building the blueprint with {$cli}..." );
+			self::quiet( array( 'npx', '-y', $cli, 'build-snapshot', '--blueprint=./blueprint.json', '--blueprint-may-read-adjacent-files', '--outfile=' . $this->build . '.zip' ), $stage );
+			self::remove( $stage );
+
+			$files = self::extract( $this->build . '.zip', $this->build );
+
+			// Playground's own files: the server keeps its wp-config.php and database.
+			self::remove( $this->build . '/wp-config.php' );
+			self::remove( $this->build . '/wp-content/db.php' );
+			self::remove( $this->build . '/wp-content/database' );
+
+			if ( is_dir( 'wp-content' ) ) {
+				WP_CLI::log( "Adding the repository's own code..." );
+				// From the root so the anchored deployignore patterns match; only wp-content.
+				self::quiet( array( 'rsync', '-rlpt', '--exclude-from=deploy/deployignore', '--include=/wp-content/***', '--exclude=*', './', $this->build . '/' ) );
+			}
+
+			$this->build_commands();
+
+			if ( ! \WP_CLI\Utils\get_flag_value( $assoc_args, 'keep-snapshot', false ) ) {
+				self::remove( $this->build . '.zip' );
+			}
+			WP_CLI::success( "Build ready in {$this->build}/ ({$files} files from the snapshot)." );
+		}
+
+		/**
+		 * Where the build is made: --build-dir, BUILD_DIR, build.dir in
+		 * deploy/config.yml, else a folder in the system temp directory (outside the
+		 * repository). The repository root itself (`.`) is for `build` and `restore`:
+		 * the build is made in the temp folder and merged into the root.
+		 */
+		private function resolve_build( $assoc_args, $allow_root ) {
+			$default                = rtrim( sys_get_temp_dir(), '/' ) . '/' . basename( $this->root ) . '-build';
+			$value                  = isset( $assoc_args['build-dir'] ) ? (string) $assoc_args['build-dir'] : ( getenv( 'BUILD_DIR' ) ? (string) getenv( 'BUILD_DIR' ) : (string) $this->config['build']['dir'] );
+			$this->into_root        = false;
+			$this->build            = $default;
+			$this->build_is_default = true;
+			if ( '' === trim( $value ) ) {
+				return;
+			}
+			$path = 0 === strpos( $value, '/' ) ? $value : $this->root . '/' . $value;
+			$real = realpath( $path );
+			if ( false !== $real && realpath( $this->root ) === $real ) {
+				if ( ! $allow_root ) {
+					WP_CLI::error( '--build-dir=. (the repository root) only works with `build` and `restore`.' );
+				}
+				$this->into_root = true;
+				return;
+			}
+			$this->build            = rtrim( $path, '/' );
+			$this->build_is_default = false;
+		}
+
+		/** Refuses to wipe a folder the user chose that is not a previous build. */
+		private function check_build_dir() {
+			if ( $this->build_is_default ) {
+				return;
+			}
+			$root = (string) realpath( $this->root );
+			$real = (string) realpath( $this->build );
+			if ( '' !== $real && ( $real === $root || 0 === strpos( $root . '/', $real . '/' ) ) ) {
+				WP_CLI::error( "The build directory {$this->build} is the repository or one of its parents: choose another --build-dir." );
+			}
+			if ( is_dir( $this->build ) && array_diff( (array) scandir( $this->build ), array( '.', '..' ) ) && ! is_file( $this->build . '/wp-includes/version.php' ) ) {
+				WP_CLI::error( "Refusing to wipe {$this->build}: it has files and is not a previous build. Choose an empty or new --build-dir." );
+			}
+		}
+
+		/** Copies the build into the repository root, deleting nothing and skipping deploy/deployignore. */
+		private function merge_into_root( $assoc_args ) {
+			self::need( 'rsync', 'it copies the build back into the repository' );
+			self::step( 'Restore' );
+			WP_CLI::log( "Copying the build into {$this->root}..." );
+			self::quiet( array( 'rsync', '-rlpt', '--exclude-from=deploy/deployignore', $this->build . '/', './' ) );
+			if ( ! \WP_CLI\Utils\get_flag_value( $assoc_args, 'keep-build', false ) ) {
+				self::remove( $this->build );
+				self::remove( $this->build . '.zip' );
+			}
+			WP_CLI::success( "The site's code is back in {$this->root} (git still ignores it)." );
+		}
+
+		/**
+		 * Deploy build/ to a server over SSH, or to a local folder. `deploy status` shows what is deployed.
+		 *
+		 * Turns maintenance mode on, backs up wp-content when deploy.backup.enabled,
+		 * copies the build (rsync or tarball), runs deploy.after on the server, and
+		 * turns maintenance mode off, also when something fails. Paths in
+		 * deploy/deployignore are never copied and never deleted on the server.
+		 *
+		 * ## OPTIONS
+		 *
+		 * [<action>]
+		 * : `status` shows which commit is deployed (it reads .git-ftp.log on the target, the file git-ftp writes too) and how many commits it is behind HEAD. Without it, deploy.
+		 *
+		 * [--env=<env>]
+		 * : Environment: production (default), staging… (DEPLOY_ENV). For an environment other than production, every variable is read with its prefix first (STAGING_SSH_HOST, then SSH_HOST).
+		 *
+		 * [--build-dir=<path>]
+		 * : The build to deploy (BUILD_DIR, build.dir). Default: the temp folder `build` makes.
+		 *
+		 * [--to=<path>]
+		 * : WordPress root on the target (DEPLOY_PATH, or environments.<env>.path).
+		 *
+		 * [--delete=<mode>]
+		 * : What may be deleted on the target (DEPLOY_DELETE, deploy.delete): mirror (the target ends up equal to the build, except deployignore), packages (only inside each plugin, theme and core directory of the build) or none.
+		 *
+		 * [--strategy=<strategy>]
+		 * : auto (default): one tarball when the target is empty, incremental rsync once it has files; rsync; or tarball: one archive copied with scp and extracted on the server, for hosts without rsync (DEPLOY_STRATEGY, deploy.strategy). An explicit tarball works with --delete=packages or none.
+		 *
+		 * [--maintenance]
+		 * : Turn maintenance mode on during the deploy (deploy.maintenance, default on). --no-maintenance to skip it.
+		 *
+		 * [--dry-run]
+		 * : Show what would change and change nothing (DRY_RUN=1).
+		 *
+		 * ## ENVIRONMENT
+		 *
+		 *     SSH_HOST, SSH_USER, SSH_PORT (22)
+		 *     SSH key: Bitbucket's BITBUCKET_SSH_KEY_FILE, then SSH_KEY_PATH, then SSH_PRIVATE_KEY (contents), else the runner's own key
+		 *     SSH_KNOWN_HOSTS    known_hosts line(s) (optional: ssh-keyscan otherwise)
+		 *     SLACK_WEBHOOK_URL  notify a Slack channel
+		 *
+		 * ## EXAMPLES
+		 *
+		 *     # Preview against a local copy of the server
+		 *     $ wp --require=deploy/deploy.php deploy --to=/tmp/server-copy --dry-run
+		 *
+		 *     # Staging (variables set by the CI)
+		 *     $ wp --require=deploy/deploy.php deploy --env=staging
+		 *
+		 *     # Which commit is on production?
+		 *     $ wp --require=deploy/deploy.php deploy status --env=production
+		 *
+		 * @when before_wp_load
+		 */
+		public function deploy( $args, $assoc_args ) {
+			chdir( $this->root );
+			$this->resolve_build( $assoc_args, false );
+			if ( isset( $args[0] ) ) {
+				if ( 'status' !== $args[0] ) {
+					WP_CLI::error( "Unknown action: {$args[0]}. Use `deploy status`, or `deploy` alone to deploy." );
+				}
+				$this->deploy_status( $assoc_args );
+				return;
+			}
+
+			$problems = $this->target( $assoc_args ); // Resolves the environment first: settings read its variables.
+			$mode     = $this->setting( $assoc_args, 'delete', 'DEPLOY_DELETE', $this->config['deploy']['delete'] );
+			$strategy = $this->setting( $assoc_args, 'strategy', 'DEPLOY_STRATEGY', $this->config['deploy']['strategy'] );
+			$dry_run  = \WP_CLI\Utils\get_flag_value( $assoc_args, 'dry-run', false ) || '1' === getenv( 'DRY_RUN' );
+			$maintain = isset( $assoc_args['maintenance'] ) ? (bool) $assoc_args['maintenance'] : (bool) $this->config['deploy']['maintenance'];
+
+			if ( ! in_array( $mode, self::DELETE_MODES, true ) ) {
+				$problems[] = "--delete (DEPLOY_DELETE) must be mirror, packages or none (got: {$mode})";
+			}
+			if ( ! in_array( $strategy, self::STRATEGIES, true ) ) {
+				$problems[] = "--strategy (DEPLOY_STRATEGY) must be rsync or tarball (got: {$strategy})";
+			} elseif ( 'tarball' === $strategy && 'mirror' === $mode ) {
+				$problems[] = 'the tarball strategy cannot mirror (it never deletes outside the packages it ships): use --delete=packages or none, or the rsync or auto strategy';
+			}
+			if ( ! is_dir( $this->build ) ) {
+				$problems[] = "no build directory at {$this->build}: run `wp --require=deploy/deploy.php build` first (or pass --build-dir)";
+			}
+			self::fail_on( $problems );
+
+			if ( $this->host ) {
+				self::need( 'ssh', 'it reaches the server' );
+			}
+			$this->connect();
+			register_shutdown_function( array( $this, 'finish' ) );
+
+			if ( 'auto' === $strategy ) {
+				// An empty target has nothing to compare with (and nothing to delete): one tarball is the fastest.
+				$empty    = $this->target_is_empty();
+				$strategy = $empty ? 'tarball' : 'rsync';
+				WP_CLI::log( 'Strategy auto: the target ' . ( $empty ? 'is empty, so one tarball.' : 'has files, so incremental rsync.' ) );
+			}
+
+			if ( 'rsync' === $strategy ) {
+				self::need( 'rsync', 'the rsync strategy copies with it (use --strategy=tarball if only the server lacks rsync)' );
+			} else {
+				self::need( 'tar', 'the tarball strategy packs the build with it' );
+				if ( $this->host ) {
+					self::need( 'scp', 'the tarball strategy copies the archive with it' );
+				}
+			}
+
+			$where = $this->host ? "{$this->login}:{$this->path}" : $this->path;
+			WP_CLI::log( "Deploying {$this->build}/ to {$where} (env: {$this->env}, delete: {$mode}, strategy: {$strategy}" . ( $dry_run ? ', dry run' : '' ) . ')' );
+
+			if ( $dry_run ) {
+				WP_CLI::log( 'Dry run: maintenance mode, backup and deploy.after are skipped.' );
+			} else {
+				if ( $maintain ) {
+					$this->maintenance_on();
+				}
+				if ( ! empty( $this->config['deploy']['backup']['enabled'] ) ) {
+					$this->backup();
+				}
+			}
+
+			if ( 'tarball' === $strategy ) {
+				$this->transfer_tarball( $mode, $dry_run );
+			} else {
+				$this->transfer_rsync( $mode, $dry_run );
+			}
+
+			if ( ! $dry_run ) {
+				$this->after_commands();
+				$this->record_commit();
+				if ( $this->in_maintenance ) {
+					$this->maintenance_off();
+				}
+			}
+
+			$this->done = true;
+			if ( ! $dry_run ) {
+				$this->notify( 'good', "Deployed to {$this->env} ({$where})." );
+			}
+			WP_CLI::success( $dry_run ? 'Dry run: nothing was changed.' : "Deployed to {$this->env}." );
+		}
+
+		/**
+		 * Build, then deploy.
+		 *
+		 * ## OPTIONS
+		 *
+		 * [--env=<env>]
+		 * : Environment (DEPLOY_ENV). See `deploy`.
+		 *
+		 * [--to=<path>]
+		 * : WordPress root on the target (DEPLOY_PATH).
+		 *
+		 * [--delete=<mode>]
+		 * : mirror, packages or none (DEPLOY_DELETE).
+		 *
+		 * [--strategy=<strategy>]
+		 * : auto, rsync or tarball (DEPLOY_STRATEGY).
+		 *
+		 * [--maintenance]
+		 * : Maintenance mode during the deploy (default on); --no-maintenance to skip.
+		 *
+		 * [--dry-run]
+		 * : Build, then show what the deploy would change.
+		 *
+		 * ## EXAMPLES
+		 *
+		 *     $ wp --require=deploy/deploy.php full --env=staging
+		 *
+		 * @when before_wp_load
+		 */
+		public function full( $args, $assoc_args ) {
+			$this->make_build( $assoc_args, false );
+			$this->deploy( $args, $assoc_args );
+		}
+
+		/**
+		 * Turn maintenance mode on or off on the target.
+		 *
+		 * Uses `wp maintenance-mode` on the server and falls back to WordPress'
+		 * .maintenance file. WordPress shows wp-content/maintenance.php when it
+		 * exists, and ends maintenance by itself after 10 minutes.
+		 *
+		 * ## OPTIONS
+		 *
+		 * <state>
+		 * : on or off.
+		 * ---
+		 * options:
+		 *   - on
+		 *   - off
+		 * ---
+		 *
+		 * [--env=<env>]
+		 * : Environment (DEPLOY_ENV).
+		 *
+		 * [--to=<path>]
+		 * : WordPress root on the target (DEPLOY_PATH).
+		 *
+		 * ## EXAMPLES
+		 *
+		 *     $ wp --require=deploy/deploy.php maintenance on --env=production
+		 *
+		 * @when before_wp_load
+		 */
+		public function maintenance( $args, $assoc_args ) {
+			chdir( $this->root );
+			self::fail_on( $this->target( $assoc_args ) );
+			$this->connect();
+			register_shutdown_function( array( $this, 'cleanup_key' ) );
+			if ( 'on' === $args[0] ) {
+				$this->maintenance_on();
+				$this->in_maintenance = false; // Asked for: stays on.
+				WP_CLI::success( "Maintenance mode on ({$this->env})." );
+			} else {
+				$this->maintenance_off();
+				WP_CLI::success( "Maintenance mode off ({$this->env})." );
+			}
+		}
+
+		/**
+		 * Put the external zips the blueprint needs into vendor/.
+		 *
+		 * Each `bundled` zip of the blueprint (vendor/<type>s/<slug>-<version>.zip)
+		 * comes from, in order: vendor/ itself, wp-content/<type>s/ (left there by
+		 * the setup), or the tag vendor/<type>/<slug>/<version>,
+		 * fetched from the remote and turned into a zip with `git archive`. `build`
+		 * runs this first.
+		 *
+		 * ## OPTIONS
+		 *
+		 * [--remote=<remote>]
+		 * : Git remote to fetch the tags from (DEPLOY_REMOTE).
+		 * ---
+		 * default: origin
+		 * ---
+		 *
+		 * @when before_wp_load
+		 */
+		public function vendor_fetch( $args, $assoc_args ) {
+			chdir( $this->root );
+			$remote  = isset( $assoc_args['remote'] ) ? $assoc_args['remote'] : ( getenv( 'DEPLOY_REMOTE' ) ? getenv( 'DEPLOY_REMOTE' ) : 'origin' );
+			$missing = array();
+			foreach ( $this->bundled_zips() as $zip ) {
+				if ( is_file( $zip['path'] ) ) {
+					continue;
+				}
+				if ( ! is_dir( dirname( $zip['path'] ) ) ) {
+					mkdir( dirname( $zip['path'] ), 0755, true );
+				}
+				$local = "wp-content/{$zip['type']}s/{$zip['file']}";
+				if ( is_file( $local ) ) {
+					copy( $local, $zip['path'] );
+					WP_CLI::log( "External {$zip['slug']} {$zip['version']}: {$local}" );
+					continue;
+				}
+				self::need( 'git', 'the external packages are rebuilt from their tags' );
+				$tag = self::VENDOR_REF . "/{$zip['type']}/{$zip['slug']}/{$zip['version']}";
+				if ( ! self::git_ok( array( 'rev-parse', '--verify', '--quiet', "refs/tags/{$tag}" ) ) ) {
+					self::git_ok( array( 'fetch', '--depth', '1', '--no-tags', $remote, "refs/tags/{$tag}:refs/tags/{$tag}" ) );
+				}
+				if ( ! self::git_ok( array( 'rev-parse', '--verify', '--quiet', "refs/tags/{$tag}" ) ) ) {
+					$missing[] = "{$zip['path']}: no tag {$tag} here or on {$remote}";
+					continue;
+				}
+				self::quiet( array( 'git', 'archive', '--format=zip', "--prefix={$zip['slug']}/", '-o', $zip['path'], "refs/tags/{$tag}" ) );
+				WP_CLI::log( "External {$zip['slug']} {$zip['version']}: tag {$tag}" );
+			}
+			if ( $missing ) {
+				$missing[] = 'publish them with `wp --require=deploy/deploy.php vendor publish`';
+				self::fail_on( $missing, 'Missing external packages:' );
+			}
+		}
+
+		/**
+		 * Publish external packages (zips or folders) as orphan branches, one tag per version.
+		 *
+		 * Each zip or folder becomes a commit on vendor/<type>/<slug> (its files at the
+		 * branch root; the previous version is the parent, so git stores only what
+		 * changed) tagged vendor/<type>/<slug>/<version>. Never switches branch nor
+		 * touches the working tree or the index. A version already published with
+		 * the same files is skipped; with different files, it is an error.
+		 *
+		 * ## OPTIONS
+		 *
+		 * [<path>...]
+		 * : Zips, or package folders (wp-content/plugins/acme), to publish. Default: the zips in vendor/{plugins,themes}/ and wp-content/{plugins,themes}/.
+		 *
+		 * [--remote=<remote>]
+		 * : Git remote to push to (DEPLOY_REMOTE).
+		 * ---
+		 * default: origin
+		 * ---
+		 *
+		 * [--push]
+		 * : Push the branches and tags. --no-push to only create them locally.
+		 * ---
+		 * default: true
+		 * ---
+		 *
+		 * ## EXAMPLES
+		 *
+		 *     $ wp --require=deploy/deploy.php vendor publish
+		 *     $ wp --require=deploy/deploy.php vendor publish wp-content/plugins/acme-pro-2.1.0.zip --no-push
+		 *     $ wp --require=deploy/deploy.php vendor publish wp-content/plugins/acme-pro
+		 *
+		 * @when before_wp_load
+		 */
+		public function vendor_publish( $args, $assoc_args ) {
+			chdir( $this->root );
+			if ( ! self::git_ok( array( 'rev-parse', '--git-dir' ) ) ) {
+				WP_CLI::error( 'Not a git repository: run `git init` (and add the remote) first.' );
+			}
+			$sources = $args ? $args : self::pending_zips();
+			if ( ! $sources ) {
+				WP_CLI::success( 'No external packages to publish.' );
+				return array();
+			}
+
+			$refs = array();
+			$keys = array();
+			foreach ( $sources as $source ) {
+				$result = $this->publish_source( $source );
+				$keys[] = $result['key'];
+				$refs   = array_merge( $refs, $result['refs'] );
+			}
+
+			$remote = isset( $assoc_args['remote'] ) ? $assoc_args['remote'] : ( getenv( 'DEPLOY_REMOTE' ) ? getenv( 'DEPLOY_REMOTE' ) : 'origin' );
+			if ( $refs && \WP_CLI\Utils\get_flag_value( $assoc_args, 'push', true ) ) {
+				self::step( "Push to {$remote}" );
+				self::run( array_merge( array( 'git', 'push', $remote ), $refs ) );
+			}
+			$tags = array();
+			foreach ( $refs as $ref ) {
+				if ( 0 === strpos( $ref, 'refs/tags/' ) ) {
+					$tags[] = $ref;
+				}
+			}
+			WP_CLI::success( $tags ? 'Published: ' . implode( ', ', $tags ) . '.' : 'Nothing new to publish.' );
+			return $keys;
+		}
+
+		/**
+		 * List the external packages: published branches and tags, and zips not published yet.
+		 *
+		 * @when before_wp_load
+		 */
+		public function vendor_list( $args, $assoc_args ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.FoundAfterLastUsed -- WP-CLI's signature.
+			chdir( $this->root );
+			$tags = self::git_lines( array( 'for-each-ref', '--format=%(refname:short)', 'refs/tags/' . self::VENDOR_REF . '/' ) );
+			WP_CLI::log( 'Published versions (tags):' );
+			foreach ( $tags ? $tags : array( '(none)' ) as $tag ) {
+				WP_CLI::log( "  {$tag}" );
+			}
+			$pending = array();
+			foreach ( self::pending_zips() as $zip ) {
+				$info = self::zip_package( $zip, false );
+				if ( $info && ! in_array( self::VENDOR_REF . "/{$info['type']}/{$info['slug']}/{$info['version']}", $tags, true ) ) {
+					$pending[] = "{$zip} ({$info['slug']} {$info['version']})";
+				}
+			}
+			WP_CLI::log( 'Zips not published yet:' );
+			foreach ( $pending ? $pending : array( '(none)' ) as $zip ) {
+				WP_CLI::log( "  {$zip}" );
+			}
+		}
+
+		/**
+		 * Put the site's code back in this folder.
+		 *
+		 * Runs `build` (external zips from vendor/, wp-content/ or the tags), then
+		 * copies build/ into the repository root without deleting anything and
+		 * minus deploy/deployignore (wp-config.php, the Studio SQLite files,
+		 * deploy/ and .git stay as they are). The restored files stay out of git
+		 * thanks to .gitignore.
+		 *
+		 * ## OPTIONS
+		 *
+		 * [--build]
+		 * : Build first (default). --no-build to use the build that is already there.
+		 * ---
+		 * default: true
+		 * ---
+		 *
+		 * [--build-dir=<path>]
+		 * : Where the build is (BUILD_DIR, build.dir); default: the temp folder `build` uses.
+		 *
+		 * [--keep-build]
+		 * : Keep the build directory afterwards.
+		 *
+		 * ## EXAMPLES
+		 *
+		 *     $ wp --require=deploy/deploy.php restore
+		 *
+		 * @when before_wp_load
+		 */
+		public function restore( $args, $assoc_args ) {
+			chdir( $this->root );
+			if ( \WP_CLI\Utils\get_flag_value( $assoc_args, 'build', true ) ) {
+				$this->make_build( $assoc_args, true );
+			} else {
+				$this->resolve_build( $assoc_args, true );
+				if ( ! is_dir( $this->build ) ) {
+					WP_CLI::error( "No build at {$this->build}: run without --no-build." );
+				}
+			}
+			$this->merge_into_root( $assoc_args );
+		}
+
+		/**
+		 * Commits one zip, or one package folder, to its orphan branch and tags it.
+		 *
+		 * @return array{key:string,refs:string[]} "type/slug/version" and the refs to push (none when already published).
+		 */
+		private function publish_source( $zip ) {
+			$is_dir = is_dir( $zip );
+			$info   = $is_dir ? self::dir_package( $zip ) : self::zip_package( $zip, true );
+			$key    = "{$info['type']}/{$info['slug']}/{$info['version']}";
+			$branch = self::VENDOR_REF . "/{$info['type']}/{$info['slug']}";
+			$tag    = "{$branch}/{$info['version']}";
+			self::step( "{$info['slug']} {$info['version']}" );
+
+			$tmp   = rtrim( sys_get_temp_dir(), '/' ) . '/vendor-publish-' . getmypid() . '-' . substr( md5( $zip ), 0, 8 );
+			$index = $tmp . '.index';
+			self::remove( $tmp );
+			mkdir( $tmp, 0755, true );
+			$work = $tmp . '/' . $info['slug'];
+			if ( $is_dir ) {
+				self::copy_tree( $zip, $work );
+			} else {
+				$archive = new ZipArchive();
+				if ( true !== $archive->open( $zip ) || ! $archive->extractTo( $tmp ) ) {
+					WP_CLI::error( "Could not extract {$zip}." );
+				}
+				$archive->close();
+				if ( ! is_dir( $work ) ) {
+					WP_CLI::error( "{$zip}: no {$info['slug']}/ folder at the zip root." );
+				}
+			}
+			$git_dir = self::git_line( array( 'rev-parse', '--absolute-git-dir' ) );
+			// A throwaway index: the repository's own index and working tree are never touched.
+			putenv( "GIT_INDEX_FILE={$index}" );
+			self::run( array( 'git', '-C', $work, '--git-dir=' . $git_dir, '--work-tree=.', 'add', '--all', '--force', '.' ) );
+			$tree = self::line( array( 'git', '-C', $work, '--git-dir=' . $git_dir, '--work-tree=.', 'write-tree' ) );
+			putenv( 'GIT_INDEX_FILE' );
+			@unlink( $index ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
+			self::remove( $tmp );
+
+			if ( self::git_ok( array( 'rev-parse', '--verify', '--quiet', "refs/tags/{$tag}" ) ) ) {
+				if ( self::git_line( array( 'rev-parse', "refs/tags/{$tag}^{tree}" ) ) === $tree ) {
+					WP_CLI::log( "Already published as {$tag}." );
+					return array(
+						'key'  => $key,
+						'refs' => array(),
+					);
+				}
+				WP_CLI::error( "{$tag} already exists with different files. A published version must not change: bump the version, or delete the tag on purpose." );
+			}
+
+			// Runners often have no git identity: fall back to one, without changing the config.
+			$identity = self::git_ok( array( 'config', 'user.email' ) ) ? array() : array( '-c', 'user.name=Project setup', '-c', 'user.email=setup@localhost' );
+			$command  = array_merge( array( 'git' ), $identity, array( 'commit-tree', $tree, '-m', "{$info['slug']} {$info['version']}" ) );
+			if ( self::git_ok( array( 'rev-parse', '--verify', '--quiet', "refs/heads/{$branch}" ) ) ) {
+				$command[] = '-p';
+				$command[] = self::git_line( array( 'rev-parse', "refs/heads/{$branch}" ) );
+			}
+			$commit = self::line( $command );
+			self::run( array( 'git', 'update-ref', "refs/heads/{$branch}", $commit ) );
+			self::run( array( 'git', 'tag', $tag, $commit ) );
+			WP_CLI::log( "Branch {$branch}, tag {$tag}." );
+			return array(
+				'key'  => $key,
+				'refs' => array( "refs/heads/{$branch}", "refs/tags/{$tag}" ),
+			);
+		}
+
+		/**
+		 * A temporary folder with blueprint.json and every "bundled" file it reads.
+		 *
+		 * @return string The folder.
+		 */
+		private function stage_blueprint() {
+			$stage = rtrim( sys_get_temp_dir(), '/' ) . '/deploy-blueprint-' . getmypid();
+			self::remove( $stage );
+			mkdir( $stage, 0755, true );
+			copy( 'blueprint.json', $stage . '/blueprint.json' );
+			$blueprint = json_decode( (string) file_get_contents( 'blueprint.json' ), true );
+			$bundled   = array();
+			$collect   = function ( $node ) use ( &$collect, &$bundled ) {
+				if ( ! is_array( $node ) ) {
+					return;
+				}
+				if ( isset( $node['resource'], $node['path'] ) && 'bundled' === $node['resource'] ) {
+					$bundled[] = ltrim( (string) $node['path'], '/' );
+				}
+				foreach ( $node as $child ) {
+					$collect( $child );
+				}
+			};
+			$collect( $blueprint );
+			foreach ( array_unique( $bundled ) as $path ) {
+				if ( ! is_file( $path ) ) {
+					WP_CLI::error( "blueprint.json needs {$path}, which is not here." );
+				}
+				if ( ! is_dir( dirname( "{$stage}/{$path}" ) ) ) {
+					mkdir( dirname( "{$stage}/{$path}" ), 0755, true );
+				}
+				copy( $path, "{$stage}/{$path}" );
+			}
+			return $stage;
+		}
+
+		/**
+		 * The external zips the blueprint expects: its "bundled" resources under vendor/<type>s/.
+		 *
+		 * @return array<int,array{path:string,file:string,type:string,slug:string,version:string}>
+		 */
+		private function bundled_zips() {
+			$blueprint = json_decode( (string) file_get_contents( 'blueprint.json' ), true );
+			$paths     = array();
+			array_walk_recursive(
+				$blueprint,
+				function ( $value, $key ) use ( &$paths ) {
+					if ( 'path' === $key && is_string( $value ) ) {
+						$paths[] = $value;
+					}
+				}
+			);
+			$zips   = array();
+			$prefix = trim( self::VENDOR_PATH, '/' ) . '/';
+			foreach ( array_unique( $paths ) as $path ) {
+				$path = ltrim( $path, '/' );
+				if ( 0 !== strpos( $path, $prefix ) || ! preg_match( '#/(plugin|theme)s/([^/]+)-(\d[^/]*)\.zip$#', $path, $match ) ) {
+					continue;
+				}
+				$zips[] = array(
+					'path'    => $path,
+					'file'    => basename( $path ),
+					'type'    => $match[1],
+					'slug'    => $match[2],
+					'version' => $match[3],
+				);
+			}
+			return $zips;
+		}
+
+		/** Zips waiting to be published: vendor/{plugins,themes}/*.zip and wp-content/{plugins,themes}/*.zip. */
+		private static function pending_zips() {
+			$zips = array();
+			foreach ( array( trim( self::VENDOR_PATH, '/' ), 'wp-content' ) as $base ) {
+				foreach ( array( 'plugins', 'themes' ) as $kind ) {
+					foreach ( (array) glob( "{$base}/{$kind}/*.zip" ) as $zip ) {
+						$zips[] = $zip;
+					}
+				}
+			}
+			return $zips;
+		}
+
+		/** Type, slug (the folder's name) and version (the plugin header or the theme's style.css) of a package folder. */
+		private static function dir_package( $dir ) {
+			$dir  = rtrim( $dir, '/' );
+			$slug = basename( $dir );
+			$type = 'themes' === basename( dirname( $dir ) ) ? 'theme' : 'plugin';
+			if ( is_file( $dir . '/style.css' ) && preg_match( '/^[ \t\/*#@]*Theme Name:/mi', (string) file_get_contents( $dir . '/style.css', false, null, 0, 8192 ) ) ) {
+				$type = 'theme';
+			}
+			$files   = 'theme' === $type ? array( $dir . '/style.css' ) : (array) glob( $dir . '/*.php' );
+			$label   = 'theme' === $type ? 'Theme' : 'Plugin';
+			$version = '';
+			foreach ( $files as $file ) {
+				$head = is_file( $file ) ? (string) file_get_contents( $file, false, null, 0, 8192 ) : '';
+				if ( preg_match( '/^[ \t\/*#@]*' . $label . ' Name:/mi', $head ) && preg_match( '/^[ \t\/*#@]*Version:\s*(\S+)/mi', $head, $match ) ) {
+					$version = $match[1];
+					break;
+				}
+			}
+			if ( '' === $version || ! preg_match( '#^[A-Za-z0-9._-]+$#', $slug . $version ) ) {
+				WP_CLI::error( "{$dir}: could not read the package's version (expected a {$label} Name and a Version header)." );
+			}
+			return array(
+				'type'    => $type,
+				'slug'    => $slug,
+				'version' => $version,
+			);
+		}
+
+		/** Copies a folder without its .git folders and symlinks. */
+		private static function copy_tree( $from, $to ) {
+			$from = rtrim( $from, '/' );
+			mkdir( $to, 0755, true );
+			$items = new RecursiveIteratorIterator( new RecursiveDirectoryIterator( $from, FilesystemIterator::SKIP_DOTS ), RecursiveIteratorIterator::SELF_FIRST );
+			foreach ( $items as $item ) {
+				$relative = substr( $item->getPathname(), strlen( $from ) + 1 );
+				if ( preg_match( '#(^|/)\.git(/|$)#', $relative ) || $item->isLink() ) {
+					continue;
+				}
+				// A file rsync left behind in an interrupted transfer: `.<name>.<6 or 10 random characters>`.
+				if ( $item->isFile() && preg_match( '/^\.(.+)\.([A-Za-z0-9]{6}|[A-Za-z0-9]{10})$/', $item->getFilename(), $leftover )
+					&& ( preg_match( '/[A-Z0-9]/', $leftover[2] ) || file_exists( dirname( $item->getPathname() ) . '/' . $leftover[1] ) ) ) {
+					continue;
+				}
+				if ( $item->isDir() ) {
+					if ( ! is_dir( "{$to}/{$relative}" ) ) {
+						mkdir( "{$to}/{$relative}", 0755, true );
+					}
+				} elseif ( $item->isFile() ) {
+					copy( $item->getPathname(), "{$to}/{$relative}" );
+				}
+			}
+		}
+
+		/**
+		 * Type, slug (the zip's top folder) and version (the plugin header or the
+		 * theme's style.css; else the file name) of an external zip.
+		 */
+		private static function zip_package( $zip, $stop_on_error ) {
+			$archive = new ZipArchive();
+			if ( true !== $archive->open( $zip ) ) {
+				if ( $stop_on_error ) {
+					WP_CLI::error( "Could not open {$zip}." );
+				}
+				return null;
+			}
+			$type = false !== strpos( $zip, '/themes/' ) ? 'theme' : 'plugin';
+			$slug = '';
+			for ( $i = 0; $i < $archive->numFiles && '' === $slug; $i++ ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- ZipArchive property.
+				$name = (string) $archive->getNameIndex( $i );
+				if ( false !== strpos( $name, '/' ) ) {
+					$slug = substr( $name, 0, strpos( $name, '/' ) );
+				}
+			}
+			$version = '';
+			for ( $i = 0; $i < $archive->numFiles && '' === $version; $i++ ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- ZipArchive property.
+				$name = (string) $archive->getNameIndex( $i );
+				$main = 'theme' === $type ? preg_match( '#^[^/]+/style\.css$#', $name ) : preg_match( '#^[^/]+/[^/]+\.php$#', $name );
+				if ( $main ) {
+					$head = substr( (string) $archive->getFromIndex( $i ), 0, 8192 );
+					if ( preg_match( '/^[ \t\/*#@]*' . ( 'theme' === $type ? 'Theme' : 'Plugin' ) . ' Name:/mi', $head ) && preg_match( '/^[ \t\/*#@]*Version:\s*(\S+)/mi', $head, $match ) ) {
+						$version = $match[1];
+					}
+				}
+			}
+			$archive->close();
+			if ( '' === $version && preg_match( '#-(\d[^/]*)\.zip$#', $zip, $match ) ) {
+				$version = $match[1];
+			}
+			if ( '' === $slug || '' === $version || ! preg_match( '#^[A-Za-z0-9._-]+$#', $slug . $version ) ) {
+				if ( $stop_on_error ) {
+					WP_CLI::error( "{$zip}: could not read the package folder and version (expected <slug>/ at the zip root with a Version header)." );
+				}
+				return null;
+			}
+			return array(
+				'type'    => $type,
+				'slug'    => $slug,
+				'version' => $version,
+			);
+		}
+
+		private static function git_ok( array $arguments ) {
+			return 0 === self::capture( array_merge( array( 'git' ), $arguments ) )[0];
+		}
+
+		private static function git_line( array $arguments ) {
+			return self::line( array_merge( array( 'git' ), $arguments ) );
+		}
+
+		/** @return string[] */
+		private static function git_lines( array $arguments ) {
+			list( $code, $stdout ) = self::capture( array_merge( array( 'git' ), $arguments ) );
+			return 0 === $code ? array_values( array_filter( array_map( 'trim', explode( "\n", $stdout ) ) ) ) : array();
+		}
+
+		/** Runs a command and returns its first output line; stops on failure. */
+		private static function line( array $command ) {
+			list( $code, $stdout, $stderr ) = self::capture( $command );
+			if ( 0 !== $code ) {
+				WP_CLI::error( 'Command failed (' . $code . '): ' . self::command( $command ) . "\n" . trim( $stderr ) );
+			}
+			return trim( (string) strtok( $stdout, "\n" ) );
+		}
+
+		/**
+		 * Runs a command and captures its output. Unlike WP_CLI::launch(), the child
+		 * inherits the whole environment, including variables set with putenv()
+		 * (GIT_INDEX_FILE).
+		 *
+		 * @return array{0:int,1:string,2:string} Exit code, stdout, stderr.
+		 */
+		private static function capture( array $command ) {
+			$pipes_spec = array(
+				1 => array( 'pipe', 'w' ),
+				2 => array( 'pipe', 'w' ),
+			);
+			$process    = proc_open( self::command( $command ), $pipes_spec, $pipes );
+			if ( ! is_resource( $process ) ) {
+				return array( 1, '', 'Could not run: ' . self::command( $command ) );
+			}
+			$stdout = (string) stream_get_contents( $pipes[1] );
+			$stderr = (string) stream_get_contents( $pipes[2] );
+			fclose( $pipes[1] );
+			fclose( $pipes[2] );
+			return array( proc_close( $process ), $stdout, $stderr );
+		}
+
+		/**
+		 * Runs at shutdown: if the deploy stopped half way, turn maintenance mode
+		 * off and report the failure; always remove the temporary key.
+		 */
+		public function finish() {
+			if ( ! $this->done ) {
+				if ( $this->in_maintenance ) {
+					WP_CLI::warning( 'The deploy failed: turning maintenance mode off.' );
+					$this->maintenance_off( false );
+				}
+				$this->notify( 'danger', "Deploy to {$this->env} failed." );
+			}
+			$this->cleanup_key();
+		}
+
+		public function cleanup_key() {
+			if ( $this->temp_key && is_file( $this->temp_key ) ) {
+				unlink( $this->temp_key );
+			}
+			$this->temp_key = null;
+		}
+
+		/**
+		 * Resolves the environment and the target path.
+		 *
+		 * @return string[] Problems found.
+		 */
+		private function target( $assoc_args ) {
+			$problems  = array();
+			$this->env = isset( $assoc_args['env'] ) ? $assoc_args['env'] : ( getenv( 'DEPLOY_ENV' ) ? getenv( 'DEPLOY_ENV' ) : 'production' );
+			if ( ! preg_match( '/^[A-Za-z0-9_-]+$/', $this->env ) ) {
+				$problems[] = "--env must be a simple name like production or staging (got: {$this->env})";
+			}
+			$configured = isset( $this->config['environments'][ $this->env ]['path'] ) ? (string) $this->config['environments'][ $this->env ]['path'] : '';
+			$this->path = rtrim( (string) $this->setting( $assoc_args, 'to', 'DEPLOY_PATH', $configured ), '/' );
+			if ( '' === $this->path ) {
+				$prefix     = 'production' === $this->env ? '' : strtoupper( $this->env ) . '_';
+				$problems[] = "{$prefix}DEPLOY_PATH (or --to, or environments.{$this->env}.path in deploy/config.yml): the WordPress root on the target";
+			}
+			$this->host = (string) $this->env_var( 'SSH_HOST' );
+			return $problems;
+		}
+
+		/** Sets up ssh/scp for the host (if any): key, known_hosts, one shared connection. */
+		private function connect() {
+			if ( '' === $this->host ) {
+				return;
+			}
+			$home = getenv( 'HOME' ) ? getenv( 'HOME' ) : sys_get_temp_dir();
+			$dir  = $home . '/.ssh';
+			if ( ! is_dir( $dir ) ) {
+				mkdir( $dir, 0700, true );
+			}
+			$port        = (string) ( $this->env_var( 'SSH_PORT' ) ? $this->env_var( 'SSH_PORT' ) : '22' );
+			$user        = (string) $this->env_var( 'SSH_USER' );
+			$this->login = ( '' !== $user ? $user . '@' : '' ) . $this->host;
+			$shared      = array( '-o', 'ControlMaster=auto', '-o', "ControlPath={$dir}/deploy-%r@%h:%p", '-o', 'ControlPersist=60' );
+
+			$key = $this->key( $dir );
+			$id  = $key ? array( '-i', $key ) : array();
+
+			$this->ssh = array_merge( array( 'ssh', '-p', $port ), $shared, $id );
+			$this->scp = array_merge( array( 'scp', '-q', '-P', $port ), $shared, $id );
+
+			$known = $this->env_var( 'SSH_KNOWN_HOSTS' );
+			if ( $known ) {
+				file_put_contents( $dir . '/known_hosts', rtrim( $known ) . "\n", FILE_APPEND );
+			} else {
+				$scan = WP_CLI::launch( self::command( array( 'ssh-keyscan', '-p', $port, $this->host ) ), false, true );
+				if ( 0 === $scan->return_code && '' !== trim( $scan->stdout ) ) {
+					file_put_contents( $dir . '/known_hosts', $scan->stdout, FILE_APPEND );
+				}
+			}
+		}
+
+		/** The SSH key: Bitbucket's, then SSH_KEY_PATH, then SSH_PRIVATE_KEY; null for the runner's own. */
+		private function key( $dir ) {
+			$bitbucket = getenv( 'BITBUCKET_SSH_KEY_FILE' );
+			if ( $bitbucket && is_readable( $bitbucket ) ) {
+				WP_CLI::log( "Using Bitbucket's SSH key." );
+				return $bitbucket;
+			}
+			$path = $this->env_var( 'SSH_KEY_PATH' );
+			if ( $path ) {
+				if ( ! is_readable( $path ) ) {
+					WP_CLI::error( "SSH_KEY_PATH is not readable: {$path}" );
+				}
+				return $path;
+			}
+			$contents = $this->env_var( 'SSH_PRIVATE_KEY' );
+			if ( ! $contents ) {
+				return null;
+			}
+			// CI variables often arrive with literal \n instead of line breaks.
+			$contents = str_replace( array( '\\n', "\r" ), array( "\n", '' ), $contents );
+			if ( false === strpos( $contents, 'BEGIN' ) ) {
+				WP_CLI::error( 'SSH_PRIVATE_KEY does not look like a private key (no BEGIN line). Paste it with its line breaks, or use your provider\'s SSH key settings (Bitbucket: Repository settings > Pipelines > SSH keys).' );
+			}
+			$this->temp_key = $dir . '/deploy_key_' . getmypid();
+			file_put_contents( $this->temp_key, rtrim( $contents ) . "\n" );
+			chmod( $this->temp_key, 0600 );
+			return $this->temp_key;
+		}
+
+		private function maintenance_on() {
+			self::step( 'Maintenance mode on' );
+			$this->on_target( 'if command -v wp >/dev/null 2>&1 && wp maintenance-mode activate >/dev/null 2>&1; then echo "Maintenance mode on (wp maintenance-mode)."; else printf \'<?php $upgrading = %s;\' "$(date +%s)" > .maintenance && echo "Maintenance mode on (.maintenance file)."; fi' );
+			$this->in_maintenance = true;
+		}
+
+		private function maintenance_off( $stop_on_error = true ) {
+			self::step( 'Maintenance mode off' );
+			$this->in_maintenance = false;
+			$this->on_target( 'if command -v wp >/dev/null 2>&1; then wp maintenance-mode deactivate >/dev/null 2>&1 || true; fi; rm -f .maintenance; echo "Maintenance mode off."', $stop_on_error );
+		}
+
+		/** tar of wp-content without uploads/cache/upgrade, keeping the last deploy.backup.keep. */
+		private function backup() {
+			self::step( 'Backup' );
+			$backup = $this->config['deploy']['backup'];
+			$keep   = max( 1, (int) $backup['keep'] );
+			$dir    = self::shell_path( (string) $backup['path'] );
+			$name   = 'wp-content_' . gmdate( 'Ymd_His' ) . '_' . substr( md5( uniqid( '', true ) ), 0, 6 ) . '.tar.gz';
+			$this->on_target(
+				'if [ ! -d wp-content ]; then echo "No wp-content to back up yet."; exit 0; fi; '
+				. "mkdir -p {$dir} && tar -czf {$dir}/{$name} --exclude=wp-content/uploads --exclude=wp-content/cache --exclude=wp-content/upgrade wp-content && echo \"Backup: {$dir}/{$name}\" && "
+				. "ls -1t {$dir}/wp-content_*.tar.gz | tail -n +" . ( $keep + 1 ) . ' | while read -r old; do rm -f "$old"; done'
+			);
+		}
+
+		private function transfer_rsync( $mode, $dry_run ) {
+			self::step( 'Copy (rsync)' );
+			// .git-ftp.log is the deploy checkpoint: never deleted, whatever deployignore says.
+			$rsync = array( 'rsync', '-rlptz', '--exclude-from=deploy/deployignore', '--exclude=/.git-ftp.log' );
+			if ( $dry_run ) {
+				$rsync[] = '--dry-run';
+				$rsync[] = '--itemize-changes';
+			}
+			if ( $this->host ) {
+				$rsync[] = '-e';
+				$rsync[] = self::command( $this->ssh );
+			} elseif ( ! $dry_run && ! is_dir( $this->path ) ) {
+				mkdir( $this->path, 0755, true );
+			}
+			$dest = ( $this->host ? $this->login . ':' : '' ) . $this->path . '/';
+
+			$paths = $this->paths();
+			if ( ! $paths ) {
+				self::run( array_merge( $rsync, 'mirror' === $mode ? array( '--delete' ) : array(), array( $this->build . '/', $dest ) ) );
+			} else {
+				if ( ! $dry_run ) {
+					$parents = array_unique( array_map( 'dirname', $paths ) );
+					$this->on_target( 'mkdir -p -- ' . implode( ' ', array_map( 'escapeshellarg', $parents ) ) );
+				}
+				foreach ( $paths as $path ) {
+					$is_dir = is_dir( "{$this->build}/{$path}" );
+					// rsync now starts at the path: re-anchor the deployignore patterns there.
+					$ignore = $this->ignore_for( $path );
+					$base   = array_merge( array( 'rsync', '-rlptz', '--exclude-from=' . $ignore ), array_slice( $rsync, 3 ) );
+					self::run( array_merge( $base, 'mirror' === $mode && $is_dir ? array( '--delete' ) : array(), array( "{$this->build}/{$path}" . ( $is_dir ? '/' : '' ), $dest . $path . ( $is_dir ? '/' : '' ) ) ) );
+					unlink( $ignore );
+				}
+			}
+
+			if ( 'packages' === $mode ) {
+				foreach ( $this->package_dirs() as $dir ) {
+					$ignore = $this->ignore_for( $dir );
+					$base   = array_merge( array( 'rsync', '-rlptz', '--exclude-from=' . $ignore ), array_slice( $rsync, 3 ) );
+					self::run( array_merge( $base, array( '--delete', "{$this->build}/{$dir}/", $dest . $dir . '/' ) ) );
+					unlink( $ignore );
+				}
+			}
+		}
+
+		private function transfer_tarball( $mode, $dry_run ) {
+			self::step( 'Copy (tarball)' );
+			$paths   = $this->paths();
+			$entries = $paths ? $paths : array_values( array_diff( (array) scandir( $this->build ), array( '.', '..' ) ) );
+			$clean   = 'packages' === $mode ? $this->package_dirs() : array();
+
+			if ( $dry_run ) {
+				WP_CLI::log( 'Would ship: ' . implode( ', ', $entries ) );
+				foreach ( $clean as $dir ) {
+					WP_CLI::log( "Would replace: {$dir}" );
+				}
+				return;
+			}
+
+			$archive = '.deploy-' . gmdate( 'Ymd_His' ) . '-' . getmypid() . '.tar.gz';
+			$local   = rtrim( sys_get_temp_dir(), '/' ) . '/' . $archive;
+			self::run( array_merge( array( 'tar', '-czf', $local, '-C', $this->build ), $entries ) );
+			WP_CLI::log( 'Archive: ' . self::size( filesize( $local ) ) );
+
+			if ( $this->host ) {
+				self::run( array_merge( $this->ssh, array( $this->login, 'mkdir -p -- ' . escapeshellarg( $this->path ) ) ) );
+				self::run( array_merge( $this->scp, array( $local, "{$this->login}:{$this->path}/{$archive}" ) ) );
+			} else {
+				if ( ! is_dir( $this->path ) ) {
+					mkdir( $this->path, 0755, true );
+				}
+				copy( $local, "{$this->path}/{$archive}" );
+			}
+			unlink( $local );
+
+			$script = '';
+			foreach ( $clean as $dir ) {
+				$script .= 'rm -rf -- ' . escapeshellarg( $dir ) . '; ';
+			}
+			$script .= 'tar -xzf ' . escapeshellarg( $archive ) . ' && rm -f ' . escapeshellarg( $archive ) . ' && echo "Extracted."';
+			$this->on_target( $script );
+		}
+
+		/** True when the target folder is missing or has no files at all. */
+		private function target_is_empty() {
+			if ( ! $this->host ) {
+				return ! is_dir( $this->path ) || ! array_diff( (array) scandir( $this->path ), array( '.', '..' ) );
+			}
+			$script                  = 'p=' . escapeshellarg( $this->path ) . '; [ ! -d "$p" ] || [ -z "$(ls -A "$p")" ]';
+			list( $code, , $stderr ) = self::capture( array_merge( $this->ssh, array( $this->login, $script ) ) );
+			if ( $code > 1 ) {
+				WP_CLI::error( "Could not look at {$this->login}:{$this->path} (ssh exit {$code}): " . trim( $stderr ) );
+			}
+			return 0 === $code;
+		}
+
+		/**
+		 * The commit this deploy ships: the CI's variable, else HEAD of this repository.
+		 *
+		 * @return string The hash, or '' when there is none.
+		 */
+		private function commit_sha() {
+			foreach ( array( 'CI_COMMIT_SHA', 'GITHUB_SHA', 'BITBUCKET_COMMIT' ) as $variable ) {
+				$value = getenv( $variable );
+				if ( $value && preg_match( '/^[0-9a-f]{7,64}$/i', $value ) ) {
+					return strtolower( $value );
+				}
+			}
+			list( $code, $stdout ) = self::capture( array( 'git', '-C', $this->root, 'rev-parse', 'HEAD' ) );
+			return ( 0 === $code && preg_match( '/^[0-9a-f]{40,64}$/', trim( $stdout ) ) ) ? trim( $stdout ) : '';
+		}
+
+		/** Writes the deployed commit to .git-ftp.log on the target: a checkpoint, and the file git-ftp uses. */
+		private function record_commit() {
+			$sha = $this->commit_sha();
+			if ( '' === $sha ) {
+				WP_CLI::warning( 'No git commit to record in .git-ftp.log (this is not a git repository, or it has no commits).' );
+				return;
+			}
+			$this->on_target( 'printf \'%s\\n\' ' . escapeshellarg( $sha ) . ' > .git-ftp.log' );
+			WP_CLI::log( ".git-ftp.log: {$sha}" );
+		}
+
+		/** `deploy status`: the commit on the target and how far it is from HEAD. */
+		private function deploy_status( $assoc_args ) {
+			$problems = $this->target( $assoc_args );
+			self::fail_on( $problems, 'Cannot read the target:' );
+			$this->connect();
+			register_shutdown_function( array( $this, 'cleanup_key' ) );
+
+			if ( $this->host ) {
+				list( $code, $stdout, $stderr ) = self::capture( array_merge( $this->ssh, array( $this->login, 'cat -- ' . escapeshellarg( $this->path . '/.git-ftp.log' ) ) ) );
+				$content                        = 0 === $code ? $stdout : '';
+				if ( $code > 1 ) {
+					WP_CLI::error( "Could not read {$this->login}:{$this->path}/.git-ftp.log (ssh exit {$code}): " . trim( $stderr ) );
+				}
+			} else {
+				$content = is_file( $this->path . '/.git-ftp.log' ) ? (string) file_get_contents( $this->path . '/.git-ftp.log' ) : '';
+			}
+
+			$sha = strtolower( trim( strtok( $content, "\n" ) ) );
+			if ( ! preg_match( '/^[0-9a-f]{7,64}$/', $sha ) ) {
+				WP_CLI::warning( "No .git-ftp.log on the {$this->env} target: nothing was deployed with this tool (or git-ftp) there yet." );
+				return;
+			}
+			WP_CLI::log( "Deployed to {$this->env}: {$sha}" );
+
+			if ( ! self::git_ok( array( '-C', $this->root, 'cat-file', '-e', $sha . '^{commit}' ) ) ) {
+				WP_CLI::warning( 'This commit is not in this repository: fetch it to compare.' );
+				return;
+			}
+			$subject = self::line( array( 'git', '-C', $this->root, 'log', '-1', '--format=%s (%ad)', '--date=short', $sha ) );
+			$behind  = (int) self::line( array( 'git', '-C', $this->root, 'rev-list', '--count', "{$sha}..HEAD" ) );
+			WP_CLI::log( "  {$subject}" );
+			WP_CLI::success( 0 === $behind ? 'HEAD is deployed.' : "{$behind} commit(s) behind HEAD." );
+		}
+
+		/** deploy.after: commands run on the target, in the WordPress root. */
+		private function after_commands() {
+			$commands = array_values( array_filter( array_map( 'strval', (array) $this->config['deploy']['after'] ) ) );
+			if ( ! $commands ) {
+				return;
+			}
+			self::step( 'After deploy' );
+			$this->on_target( 'command -v wp >/dev/null 2>&1 || echo "Warning: no wp (WP-CLI) on the target."; ' . implode( ' && ', $commands ) );
+		}
+
+		/** build.commands: each runs in <build>/<path>, with DEPLOY_ROOT set to the repository root. */
+		private function build_commands() {
+			$commands = (array) $this->config['build']['commands'];
+			if ( ! $commands ) {
+				return;
+			}
+			putenv( 'DEPLOY_ROOT=' . $this->root );
+			foreach ( $commands as $command ) {
+				$path = isset( $command['path'] ) ? trim( (string) $command['path'], '/' ) : '';
+				$run  = isset( $command['run'] ) ? (string) $command['run'] : '';
+				if ( '' === $run ) {
+					continue;
+				}
+				$cwd = $this->build . ( '' === $path || '.' === $path ? '' : '/' . $path );
+				if ( ! is_dir( $cwd ) ) {
+					WP_CLI::error( "build.commands: {$cwd} does not exist (path: {$path})." );
+				}
+				WP_CLI::log( "In {$cwd}: {$run}" );
+				self::shell( $run, $cwd );
+			}
+		}
+
+		/** Runs a shell script in the WordPress root of the target (ssh, or locally). */
+		private function on_target( $script, $stop_on_error = true ) {
+			$script = 'cd ' . escapeshellarg( $this->path ) . ' && { ' . $script . '; }';
+			if ( $this->host ) {
+				return self::run( array_merge( $this->ssh, array( $this->login, $script ) ), null, $stop_on_error );
+			}
+			if ( ! is_dir( $this->path ) ) {
+				mkdir( $this->path, 0755, true );
+			}
+			return self::shell( $script, null, $stop_on_error );
+		}
+
+		/**
+		 * deploy/deployignore re-anchored at a sub-path, for an rsync that starts
+		 * there: "/wp-content/uploads/" becomes "/uploads/" for wp-content, patterns
+		 * outside the path are dropped, unanchored ones ("*.log") are kept.
+		 *
+		 * @return string Temporary file.
+		 */
+		private function ignore_for( $path ) {
+			$prefix = '/' . trim( $path, '/' ) . '/';
+			$lines  = array();
+			foreach ( (array) file( 'deploy/deployignore', FILE_IGNORE_NEW_LINES ) as $line ) {
+				$pattern = trim( $line );
+				if ( '' === $pattern || '#' === $pattern[0] ) {
+					continue;
+				}
+				if ( '/' !== $pattern[0] ) {
+					$lines[] = $pattern;
+				} elseif ( 0 === strpos( $pattern, $prefix ) && strlen( $pattern ) > strlen( $prefix ) ) {
+					$lines[] = '/' . substr( $pattern, strlen( $prefix ) );
+				}
+			}
+			$file = tempnam( sys_get_temp_dir(), 'deployignore-' );
+			file_put_contents( $file, implode( "\n", $lines ) . "\n" );
+			return $file;
+		}
+
+		/** deploy.paths, cleaned; empty means the whole build. */
+		private function paths() {
+			$paths = array();
+			foreach ( (array) $this->config['deploy']['paths'] as $path ) {
+				$path = trim( (string) $path, '/' );
+				if ( '' === $path ) {
+					continue;
+				}
+				if ( ! file_exists( "{$this->build}/{$path}" ) ) {
+					WP_CLI::warning( "deploy.paths: {$this->build}/{$path} does not exist, skipped." );
+					continue;
+				}
+				$paths[] = $path;
+			}
+			return $paths;
+		}
+
+		/** Core directories and each plugin and theme directory of the build (within deploy.paths). */
+		private function package_dirs() {
+			$dirs = array();
+			foreach ( array( 'wp-admin', 'wp-includes' ) as $dir ) {
+				if ( is_dir( "{$this->build}/{$dir}" ) ) {
+					$dirs[] = $dir;
+				}
+			}
+			foreach ( array( 'plugins', 'themes' ) as $kind ) {
+				foreach ( (array) glob( "{$this->build}/wp-content/{$kind}/*", GLOB_ONLYDIR ) as $dir ) {
+					$dirs[] = substr( $dir, strlen( $this->build . '/' ) );
+				}
+			}
+			$paths = $this->paths();
+			if ( ! $paths ) {
+				return $dirs;
+			}
+			return array_values(
+				array_filter(
+					$dirs,
+					function ( $dir ) use ( $paths ) {
+						foreach ( $paths as $path ) {
+							if ( $dir === $path || 0 === strpos( $dir, $path . '/' ) || 0 === strpos( $path, $dir . '/' ) ) {
+								return true;
+							}
+						}
+						return false;
+					}
+				)
+			);
+		}
+
+		/** Option > environment variable (with the environment's prefix first) > config > default. */
+		private function setting( $assoc_args, $option, $variable, $fallback ) {
+			if ( isset( $assoc_args[ $option ] ) && '' !== $assoc_args[ $option ] ) {
+				return $assoc_args[ $option ];
+			}
+			$value = $this->env_var( $variable );
+			return ( false !== $value && '' !== $value ) ? $value : $fallback;
+		}
+
+		/** STAGING_X for --env=staging (any environment but production), then X. */
+		private function env_var( $name ) {
+			if ( 'production' !== $this->env ) {
+				$value = getenv( strtoupper( $this->env ) . '_' . $name );
+				if ( false !== $value && '' !== $value ) {
+					return $value;
+				}
+			}
+			return getenv( $name );
+		}
+
+		private function notify( $color, $text ) {
+			$url = $this->env_var( 'SLACK_WEBHOOK_URL' );
+			if ( ! $url ) {
+				$url = (string) $this->config['notify']['slack_webhook'];
+			}
+			if ( '' === $url ) {
+				return;
+			}
+			$payload = array(
+				'attachments' => array(
+					array(
+						'color'  => $color,
+						'title'  => 'WordPress deployment',
+						'text'   => $text,
+						'footer' => gmdate( 'Y-m-d H:i:s' ) . ' UTC',
+					),
+				),
+			);
+			try {
+				$options = array(
+					'timeout'       => 15,
+					'halt_on_error' => false,
+				);
+				\WP_CLI\Utils\http_request( 'POST', $url, json_encode( $payload ), array( 'Content-Type' => 'application/json' ), $options );
+			} catch ( Exception $e ) {
+				WP_CLI::warning( 'Slack notification failed: ' . $e->getMessage() );
+			}
+		}
+
+		/** Stops with an install hint when a tool is not on the PATH. */
+		private static function need( $tool, $why ) {
+			list( $code ) = self::capture( array( '/bin/sh', '-c', 'command -v ' . escapeshellarg( $tool ) ) );
+			if ( 0 !== $code ) {
+				WP_CLI::error( "{$tool} was not found: {$why}. Install it, then run again." );
+			}
+		}
+
+		/** Prints every problem, then stops. */
+		private static function fail_on( array $problems, $title = 'Cannot deploy:' ) {
+			if ( ! $problems ) {
+				return;
+			}
+			$lines = array( $title );
+			foreach ( $problems as $problem ) {
+				$lines[] = "  - {$problem}";
+			}
+			WP_CLI::error_multi_line( $lines );
+			WP_CLI::halt( 1 );
+		}
+
+		private static function step( $title ) {
+			WP_CLI::log( WP_CLI::colorize( "%B== {$title}%n" ) );
+		}
+
+		/** "~/x" for a shell (the home of the user running it), quoted otherwise. */
+		private static function shell_path( $path ) {
+			if ( 0 === strpos( $path, '~/' ) ) {
+				return '"$HOME"/' . escapeshellarg( substr( $path, 2 ) );
+			}
+			return escapeshellarg( $path );
+		}
+
+		/**
+		 * Runs a command with its output going straight to the terminal (build
+		 * progress, rsync's list of changes). WP_CLI::launch() would capture it.
+		 */
+		private static function run( array $command, $cwd = null, $stop_on_error = true ) {
+			return self::shell( self::command( $command ), $cwd, $stop_on_error );
+		}
+
+		private static function shell( $line, $cwd = null, $stop_on_error = true ) {
+			WP_CLI::debug( $line, 'deploy' );
+			$process = proc_open( $line, array( STDIN, STDOUT, STDERR ), $pipes, $cwd );
+			if ( ! is_resource( $process ) ) {
+				WP_CLI::error( "Could not run: {$line}" );
+			}
+			$code = proc_close( $process );
+			if ( 0 === $code || ! $stop_on_error ) {
+				return $code;
+			}
+			self::fail( $code, $line );
+		}
+
+		/**
+		 * Like run(), without the tool's own output (npm's engine warnings, Playground's
+		 * progress, rsync): it is kept in a temporary file and shown only when the command
+		 * fails, or live with WP-CLI's global --debug.
+		 */
+		private static function quiet( array $command, $cwd = null ) {
+			if ( WP_CLI::get_config( 'debug' ) ) {
+				return self::run( $command, $cwd );
+			}
+			$line = self::command( $command );
+			WP_CLI::debug( $line, 'deploy' );
+			$log    = tempnam( sys_get_temp_dir(), 'deploy-log-' );
+			$handle = fopen( $log, 'w' );
+			// One file for both streams: no pipe to fill up while a long command runs.
+			$process = proc_open( $line, array( STDIN, $handle, $handle ), $pipes, $cwd );
+			if ( ! is_resource( $process ) ) {
+				fclose( $handle );
+				unlink( $log );
+				WP_CLI::error( "Could not run: {$line}" );
+			}
+			$code = proc_close( $process );
+			fclose( $handle );
+			$output = (string) file_get_contents( $log );
+			unlink( $log );
+			if ( 0 !== $code ) {
+				fwrite( STDERR, $output );
+				self::fail( $code, $line );
+			}
+			return $code;
+		}
+
+		private static function fail( $code, $line ) {
+			if ( 127 === $code ) {
+				WP_CLI::error( "A command was not found (127): install it on this machine and run again. {$line}" );
+			}
+			WP_CLI::error( "Command failed ({$code}): {$line}" );
+		}
+
+		/** Human-readable size (WordPress' size_format() is not loaded here). */
+		private static function size( $bytes ) {
+			$units = array( 'B', 'KB', 'MB', 'GB' );
+			$last  = count( $units ) - 1;
+			$i     = 0;
+			while ( $bytes >= 1024 && $i < $last ) {
+				$bytes /= 1024;
+				++$i;
+			}
+			return round( $bytes, 1 ) . ' ' . $units[ $i ];
+		}
+
+		private static function command( array $parts ) {
+			return implode( ' ', array_map( 'escapeshellarg', $parts ) );
+		}
+
+		/**
+		 * Extracts the Playground snapshot. Its entries are stored as /wordpress/...;
+		 * the prefix is dropped.
+		 *
+		 * @return int Files extracted.
+		 */
+		private static function extract( $zip_file, $dest ) {
+			$zip = new ZipArchive();
+			if ( true !== $zip->open( $zip_file ) ) {
+				WP_CLI::error( "Could not open {$zip_file}." );
+			}
+			$count = 0;
+			for ( $i = 0; $i < $zip->numFiles; $i++ ) { // phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase -- ZipArchive property.
+				$name     = (string) $zip->getNameIndex( $i );
+				$relative = preg_replace( '#^/?wordpress/#', '', $name );
+				if ( '' === $relative || '/' === substr( $relative, -1 ) ) {
+					continue;
+				}
+				if ( preg_match( '#(^|/)\.\.(/|$)#', $relative ) ) {
+					WP_CLI::error( "Unsafe path in {$zip_file}: {$name}" );
+				}
+				$target = $dest . '/' . $relative;
+				if ( ! is_dir( dirname( $target ) ) ) {
+					mkdir( dirname( $target ), 0755, true );
+				}
+				$in  = $zip->getStream( $name );
+				$out = fopen( $target, 'wb' );
+				stream_copy_to_stream( $in, $out );
+				fclose( $in );
+				fclose( $out );
+				++$count;
+			}
+			$zip->close();
+			return $count;
+		}
+
+		private static function remove( $path ) {
+			if ( is_link( $path ) || is_file( $path ) ) {
+				unlink( $path );
+				return;
+			}
+			if ( ! is_dir( $path ) ) {
+				return;
+			}
+			$items = new RecursiveIteratorIterator(
+				new RecursiveDirectoryIterator( $path, FilesystemIterator::SKIP_DOTS ),
+				RecursiveIteratorIterator::CHILD_FIRST
+			);
+			foreach ( $items as $item ) {
+				if ( $item->isDir() && ! $item->isLink() ) {
+					rmdir( $item->getPathname() );
+				} else {
+					unlink( $item->getPathname() );
+				}
+			}
+			rmdir( $path );
+		}
+	}
+
+	$ci_deploy = new CI_Deploy_Command();
+	foreach ( array( 'build', 'deploy', 'full', 'maintenance', 'restore', 'vendor fetch', 'vendor publish', 'vendor list' ) as $ci_deploy_command ) {
+		WP_CLI::add_command( $ci_deploy_command, array( $ci_deploy, str_replace( ' ', '_', $ci_deploy_command ) ), array( 'when' => 'before_wp_load' ) );
+	}
+}

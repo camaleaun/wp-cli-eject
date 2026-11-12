@@ -1,0 +1,102 @@
+{{! TODO: no visible credit and no 'generated' text on purpose, see Pipeline::is_generated() (src/Pipeline.php): an option may add one back. }}
+# =============================================================================
+# DEPLOYMENT CONFIGURATION
+# =============================================================================
+# Written once and never overwritten: this file is yours. Read by deploy/deploy.php.
+#
+# Order of precedence: command option > environment variable > this file > default.
+# For an environment other than production, variables are read with its prefix
+# first: STAGING_DEPLOY_PATH, then DEPLOY_PATH.
+#
+# YAML note: quote values like 'yes', 'no', 'on', 'off', 'y' or 'n' when they
+# must stay text.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# BUILD
+# -----------------------------------------------------------------------------
+build:
+  # Where the build is made (BUILD_DIR, --build-dir). Default: a folder in the system
+  # temp directory, outside the repository. A relative path is relative to the
+  # repository; `.` (the repository root) is for `build` and `restore`: the build is
+  # made in the temp folder and merged into the root.
+  dir: ''
+
+  # Commands run after the code is assembled in build/, each inside build/<path>.
+  # DEPLOY_ROOT is the repository root (e.g. to apply patches kept in the repo).
+  commands: []
+  # commands:
+  #   - path: wp-content/themes/acme-child
+  #     run: npm ci && npm run build
+  #   - path: wp-content/mu-plugins/acme
+  #     run: composer install --no-dev --optimize-autoloader
+  #   - path: wp-content/plugins/woocommerce
+  #     run: patch -p1 < "$DEPLOY_ROOT/patches/woocommerce-fix.patch"
+
+# -----------------------------------------------------------------------------
+# DEPLOY
+# -----------------------------------------------------------------------------
+deploy:
+  # What may be deleted on the server (DEPLOY_DELETE, --delete):
+  #   mirror   - the server ends up equal to the build, except deploy/deployignore
+  #   packages - deletes only inside each plugin, theme and core directory of the build
+  #   none     - only adds and updates
+  delete: {{{deploy_delete}}}
+
+  # How files get there (DEPLOY_STRATEGY, --strategy):
+  #   auto     - one tarball when the target is empty (nothing to compare, nothing to
+  #              delete), incremental rsync once it has files
+  #   rsync    - always incremental; needs rsync on the server
+  #   tarball  - always one archive copied with scp and extracted on the server; for
+  #              hosts without rsync (e.g. WP Engine). Works with delete: packages
+  #              or none; it cannot mirror. With packages, each plugin, theme and core
+  #              folder it ships is replaced whole: what exists only on the server
+  #              inside it is lost.
+  # Each deploy writes the commit it shipped to .git-ftp.log on the target (the file
+  # git-ftp uses): `deploy status` reads it.
+  strategy: auto
+
+  # Deploy only these paths of the build (empty: all of it, core included).
+  # Hosts that manage WordPress core themselves only need wp-content; to ship
+  # just themes and plugins, list wp-content/themes and wp-content/plugins:
+  # paths:
+  #   - wp-content/themes
+  #   - wp-content/plugins
+  #   - wp-content/mu-plugins
+  paths: []
+
+  # WordPress maintenance mode during the deploy (`wp maintenance-mode`, or the
+  # .maintenance file). It is turned off at the end, also when the deploy fails.
+  # A custom page can live in wp-content/maintenance.php.
+  maintenance: true
+
+  # Backup of the server's wp-content (without uploads, cache, upgrade) before
+  # each deploy, keeping the last `keep`. `path` is on the server; keep it
+  # outside the web root.
+  backup:
+    enabled: false
+    keep: 5
+    path: '~/deploy-backups'
+
+  # Commands run on the server, in the WordPress root, after the files are copied.
+  after: []
+  # after:
+  #   - wp cache flush
+  #   - wp rewrite flush
+
+# -----------------------------------------------------------------------------
+# ENVIRONMENTS
+# -----------------------------------------------------------------------------
+# The WordPress root of each environment (or DEPLOY_PATH / STAGING_DEPLOY_PATH).
+environments:
+  production:
+    path: ''
+  staging:
+    path: ''
+
+# -----------------------------------------------------------------------------
+# NOTIFICATIONS
+# -----------------------------------------------------------------------------
+# Better as a secured CI variable: SLACK_WEBHOOK_URL.
+notify:
+  slack_webhook: ''

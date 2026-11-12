@@ -1,0 +1,897 @@
+<?php
+
+namespace Camaleaun\Eject;
+
+use Camaleaun\Eject\Checksums\Core;
+use Camaleaun\Eject\Checksums\Directory;
+use WP_CLI;
+use WP_CLI\Utils;
+
+/**
+ * Verifies the site against wordpress.org, ejects what can be downloaded again,
+ * packs the rest and writes a blueprint that rebuilds the site's code.
+ */
+class Command {
+
+	/**
+	 * Verify core, plugins and themes, then write a blueprint that rebuilds them.
+	 *
+	 * Every file is checked against wordpress.org: core and plugins with the
+	 * official checksums, themes (and plugin versions without checksums) with the
+	 * zip of the installed version. A modified file is an error and stops
+	 * everything before anything is written; an added or missing file is a
+	 * warning and the added file is kept.
+	 *
+	 * By default the site is not changed: a self-contained Playground blueprint
+	 * bundle is written instead (a zip, or a directory with --bundle=<dir>). It
+	 * holds blueprint.json, the packages that are not in the wordpress.org
+	 * directory (external) as zips, the site's own code (custom packages,
+	 * mu-plugins, drop-ins, translations, added files) and the pipeline. Unzipped,
+	 * it is the project repository.
+	 *
+	 * With --no-bundle the work happens in the site itself: the report is printed
+	 * and blueprint.json and the pipeline written there; with --apply, verified
+	 * wordpress.org files are deleted, external packages are zipped next to their
+	 * folder with an EJECT.md and the folder is removed.
+	 *
+	 * Studio files (SQLite drop-in, database, mu-plugins, AGENTS.md…),
+	 * wp-config.php, uploads and leftovers are never ejected nor bundled; the
+	 * "Not ejected" table at the end says why.
+	 *
+	 * ## OPTIONS
+	 *
+	 * [--bundle[=<path>]]
+	 * : Write a blueprint bundle and leave the site untouched (default). The path ends in .zip for a zip, otherwise it is a directory; relative to the site root. Default: <site>/<site folder>-bundle.zip. Use --no-bundle to work in the site itself.
+	 * ---
+	 * default: true
+	 * ---
+	 *
+	 * [--apply]
+	 * : With --no-bundle: delete the verified files and pack the external packages. Without it, nothing is deleted.
+	 *
+	 * [--keep-plugins=<slugs>]
+	 * : Comma-separated plugin slugs to keep as custom code (not verified, not ejected; copied into the bundle).
+	 *
+	 * [--keep-themes=<slugs>]
+	 * : Comma-separated theme slugs to keep in the repo as custom.
+	 *
+	 * [--skip-core]
+	 * : With --no-bundle: verify core but never delete it (the blueprint still pins its version).
+	 *
+	 * [--db]
+	 * : Load WordPress (needs a working database) to read the active plugins, theme and site language, so the blueprint activates them. Without it only files are read, no site code runs, and nothing is activated.
+	 *
+	 * [--php=<version>]
+	 * : PHP version for the blueprint (major.minor). Defaults to the PHP running the command.
+	 *
+	 * [--output=<file>]
+	 * : With --no-bundle: where to write the blueprint (default: blueprint.json in the site root; in a bundle it is always blueprint.json at its root).
+	 *
+	 * [--vendor-path=<path>]
+	 * : Where the external zips are, relative to the blueprint (in a repository, `build` makes them there from the tags vendor/<type>/<slug>/<version>).
+	 * ---
+	 * default: vendor
+	 * ---
+	 *
+	 * [--activate-with-hooks]
+	 * : Activate each active plugin with installPlugin's activate option (runs activation hooks) instead of setting active_plugins at the end.
+	 *
+	 * [--git-provider=<provider>]
+	 * : Where the project repository lives; selects the CI/CD file written next to the blueprint. Required unless --no-ci.
+	 * ---
+	 * options:
+	 *   - github
+	 *   - gitlab
+	 *   - bitbucket
+	 * ---
+	 *
+	 * [--ci]
+	 * : Write the CI/CD that rebuilds the site from the blueprint and deploys it over SSH (deploy/ scripts + the provider's file). Use --no-ci to skip it.
+	 * ---
+	 * default: true
+	 * ---
+	 *
+	 * [--git-deploy-branch=<branch>]
+	 * : Pushes to this branch build and deploy to production. Default: the branch the repository already uses (origin's HEAD, else the checked out one), or main for a new repository. --deploy-branch is the old name.
+	 *
+	 * [--git-staging-branch=<branch>]
+	 * : Pushes to this branch build and deploy to the staging environment (default staging). --staging-branch is the old name.
+	 *
+	 * [--deploy-branch=<branch>]
+	 * : Alias of --git-deploy-branch.
+	 *
+	 * [--staging-branch=<branch>]
+	 * : Alias of --git-staging-branch.
+	 *
+	 * [--deploy-delete=<mode>]
+	 * : What the deploy may delete on the server (DEPLOY_DELETE in the CI file, editable there): mirror (server equals the build, except deploy/deployignore), packages (only inside each plugin/theme/core directory of the build) or none.
+	 * ---
+	 * default: mirror
+	 * options:
+	 *   - mirror
+	 *   - packages
+	 *   - none
+	 * ---
+	 *
+	 * [--overwrite-ci]
+	 * : Replace CI/CD files, .gitignore and .editorconfig that exist but were not generated by wp eject (deploy/config.yml is never replaced).
+	 *
+	 * [--known=<files>]
+	 * : Comma-separated YAML files of known differences, added to the package's known.yml: modified files that are not code changes (optionally pinned by sha256) count as verified; files a package writes at runtime are ignored and protected on deploy.
+	 *
+	 * [--save-known=<file>]
+	 * : Write a YAML rule (exact version, sha256 of each modified file, each added file) for every package that still has modified or added files, to review and pass with --known. The result of the run does not change.
+	 *
+	 * [--cache]
+	 * : Keep the zips of released versions and WordPress's checksums in WP-CLI's download cache (~/.wp-cli/cache) and reuse them. --no-cache neither reads nor writes it.
+	 * ---
+	 * default: true
+	 * ---
+	 *
+	 * [--update-deploy]
+	 * : Regenerate the deploy files of an already ejected repository (deploy/deploy.php, deploy/README.md, the CI file, .gitignore, .editorconfig and README.md) from its blueprint.json and git, and bring an outdated blueprint.json up to date (a `meta` without `author` is removed), without verifying anything and without the WordPress core. Run it in the repository (or give WP-CLI's --path). deploy/config.yml and deploy/deployignore are yours and are never touched. Needs --git-provider, and --git-deploy-branch/--git-staging-branch if they are not the defaults.
+	 *
+	 * [--git-origin-branch=<name>]
+	 * : The branch the work branch is made from, checked out first (the working tree must be clean). Default: the branch checked out.
+	 *
+	 * [--git-branch[=<name>]]
+	 * : Alias of --git-work-branch.
+	 *
+	 * [--git-work-branch[=<name>]]
+	 * : Commit on a new work branch (default name chore/project-setup when given without a name), made from the current branch of an existing repository (the bundle can be an existing repository with a clean working tree: its files are written over, nothing is deleted). Without it, a repository that already has history is not committed. A new repository gets the branch after its first commit.
+	 *
+	 * [--git]
+	 * : Leave the output folder (a directory bundle, or the site with --no-bundle) ready to push: git init when there is no repository, each external package on its own orphan branch with a tag per version, and the first commit of a new repository. --no-git to skip. Skipped for a zip bundle.
+	 * ---
+	 * default: true
+	 * ---
+	 *
+	 * [--report]
+	 * : Print the package table, the file lists and the "Not ejected" table. --no-report prints only the verification progress, errors, warnings and the summary.
+	 * ---
+	 * default: true
+	 * ---
+	 *
+	 * [--format=<format>]
+	 * : Report format.
+	 * ---
+	 * default: table
+	 * options:
+	 *   - table
+	 *   - json
+	 * ---
+	 *
+	 * [--yes]
+	 * : Do not ask for confirmation before --apply.
+	 *
+	 * ## EXAMPLES
+	 *
+	 *     # Bundle (site untouched): <site>/<folder>-bundle.zip with GitHub Actions
+	 *     $ wp eject --git-provider=github
+	 *
+	 *     # Keep the client's own plugin and child theme as custom code, bundle as a directory
+	 *     $ wp eject --git-provider=bitbucket --keep-plugins=acme-core --keep-themes=acme-child --bundle=../acme-repo
+	 *
+	 *     # Work in the site itself and eject for real
+	 *     $ wp eject --git-provider=gitlab --no-bundle --apply
+	 *
+	 * @when before_wp_load
+	 */
+	public function __invoke( $args, $assoc_args ) {
+		Cache::$enabled = (bool) Utils\get_flag_value( $assoc_args, 'cache', true );
+		$assoc_args     = self::branch_aliases( $assoc_args );
+		if ( Utils\get_flag_value( $assoc_args, 'update-deploy', false ) ) {
+			$this->update_deploy( $assoc_args );
+			return;
+		}
+		$apply  = (bool) Utils\get_flag_value( $assoc_args, 'apply', false );
+		$json   = 'json' === Utils\get_flag_value( $assoc_args, 'format', 'table' );
+		$vendor = Utils\get_flag_value( $assoc_args, 'vendor-path', 'vendor' );
+
+		// --bundle (default true), --bundle=<path>, or --no-bundle.
+		$bundle_arg = Utils\get_flag_value( $assoc_args, 'bundle', true );
+		$bundled    = false !== $bundle_arg && 'false' !== $bundle_arg;
+		$assoc_args = $this->with_default_branches( $assoc_args, $bundled ? $bundle_arg : false );
+		if ( $bundled && $apply ) {
+			WP_CLI::error( '--apply deletes files in the site; it only works with --no-bundle. A bundle never changes the site.' );
+		}
+		if ( $bundled && isset( $assoc_args['output'] ) ) {
+			WP_CLI::warning( '--output is ignored with a bundle: blueprint.json is at the bundle root.' );
+		}
+
+		$pipeline = (bool) Utils\get_flag_value( $assoc_args, 'ci', true );
+		if ( $pipeline ) {
+			Pipeline::validate(
+				(string) Utils\get_flag_value( $assoc_args, 'git-provider', '' ),
+				(string) Utils\get_flag_value( $assoc_args, 'deploy-branch', 'main' ),
+				(string) Utils\get_flag_value( $assoc_args, 'deploy-delete', 'mirror' ),
+				(string) Utils\get_flag_value( $assoc_args, 'staging-branch', 'staging' )
+			);
+		}
+
+		Requirements::require_zip();
+		$want_git = (bool) Utils\get_flag_value( $assoc_args, 'git', true );
+		$missing  = Requirements::note(
+			array_merge(
+				$want_git ? array( 'git' => 'the repository is not prepared (no git init, branches, tags or commit); add --no-git to skip it' ) : array(),
+				array(
+					'npx'   => '`build`, `restore` and the CI build run the WordPress Playground CLI with it (install Node.js)',
+					'rsync' => '`build` and `deploy` copy files with it',
+				)
+			),
+			$json
+		);
+		if ( in_array( 'git', $missing, true ) ) {
+			$assoc_args['git'] = false;
+		}
+		$use_git       = (bool) Utils\get_flag_value( $assoc_args, 'git', true );
+		$deploy_branch = (string) Utils\get_flag_value( $assoc_args, 'deploy-branch', 'main' );
+		$git_branch    = Utils\get_flag_value( $assoc_args, 'git-branch', null );
+		if ( true === $git_branch ) {
+			$git_branch = Git::DEFAULT_BRANCH;
+		}
+
+		$site   = Site::detect( (bool) Utils\get_flag_value( $assoc_args, 'db', false ) );
+		$origin = (string) Utils\get_flag_value( $assoc_args, 'git-origin-branch', '' );
+		if ( '' !== $origin && ! $bundled && $use_git ) {
+			Git::use_origin( rtrim( $site->root, '/' ), $origin, $log );
+		}
+		Git::snapshot( $site->root ); // Before anything is written: pending changes decide what may be replaced.
+		if ( isset( $assoc_args['php'] ) ) {
+			if ( ! preg_match( '/^\d+\.\d+$/', $assoc_args['php'] ) ) {
+				WP_CLI::error( '--php must be major.minor, e.g. 8.3.' );
+			}
+			$site->php_version = $assoc_args['php'];
+		}
+		if ( $site->multisite ) {
+			WP_CLI::warning( 'Multisite: only network and main-site activations are read.' );
+		}
+
+		$inventory = new Inventory( $site );
+		$core      = $inventory->core();
+		$plugins   = $inventory->plugins();
+		$themes    = $inventory->themes();
+
+		$this->mark_custom( $plugins, self::slugs( $assoc_args, 'plugin' ), 'plugin' );
+		$this->mark_custom( $themes, self::slugs( $assoc_args, 'theme' ), 'theme' );
+
+		$log      = function ( $message ) use ( $json ) {
+			if ( ! $json ) {
+				WP_CLI::log( $message );
+			}
+		};
+		$report   = (bool) Utils\get_flag_value( $assoc_args, 'report', true );
+		$progress = function ( $message ) use ( $json, $report ) {
+			if ( ! $json && $report ) {
+				WP_CLI::log( $message );
+			}
+		};
+
+		if ( ! $site->has_db ) {
+			$progress( 'Without --db: only files are read and the blueprint will not activate plugins or the theme. Use --db for that.' );
+		}
+		$log( "Verifying WordPress {$core->version}…" );
+		Core::verify( $core, $site );
+		foreach ( array_merge( array_values( $plugins ), array_values( $themes ) ) as $package ) {
+			if ( Package::SOURCE_CUSTOM !== $package->source ) {
+				$log( "Verifying {$package->label()}…" );
+				Directory::verify( $package );
+				if ( $package->modified ) {
+					Core::verify_bundled( $package, $core->version );
+				}
+			}
+		}
+
+		$packages = array_merge( array( $core ), array_values( $plugins ), array_values( $themes ) );
+
+		// Known differences: the package's known.yml plus --known files.
+		$known = Known::load( self::known_files( $assoc_args, $site ) );
+		foreach ( $packages as $package ) {
+			if ( Package::SOURCE_CUSTOM !== $package->source && ! $package->unverifiable ) {
+				$known->apply( $package, $site->relative( $package->path ) );
+			}
+		}
+		if ( isset( $assoc_args['save-known'] ) ) {
+			$saved = Known::save( $packages, $assoc_args['save-known'] );
+			$log( "Known differences: {$saved} rule(s) written to {$assoc_args['save-known']} (review them, then pass the file with --known)." );
+		}
+
+		$kept = new Kept( $site );
+		$kept->scan( $inventory );
+		$skip_core = (bool) Utils\get_flag_value( $assoc_args, 'skip-core', false );
+		if ( $skip_core ) {
+			$kept->add( 'wp-admin, wp-includes, wp-*.php', 'core: --skip-core' );
+		}
+		foreach ( $packages as $package ) {
+			$where = $site->relative( $package->path );
+			if ( Package::SOURCE_CUSTOM === $package->source ) {
+				$kept->add( $where, "custom (--keep-{$package->type}s)", true );
+			} elseif ( Package::STATUS_ERROR === $package->status() ) {
+				$kept->add( $where ?: '(core)', $package->modified ? count( $package->modified ) . ' modified file(s): ERROR' : 'could not be verified: ERROR' );
+			} elseif ( $package->added ) {
+				$kept->add( ( $where ?: '(core)' ) . ' (' . count( $package->added ) . ' added file(s))', 'not shipped by wordpress.org: kept, review them' );
+			}
+		}
+
+		$errors = array_filter(
+			$packages,
+			function ( Package $package ) {
+				return Package::STATUS_ERROR === $package->status();
+			}
+		);
+
+		$summary = array(
+			'wordpress' => $core->version,
+			'php'       => $site->php_version,
+			'locale'    => $site->locale,
+			'database'  => $site->has_db,
+			'applied'   => false,
+			'errors'    => count( $errors ),
+			'warnings'  => count(
+				array_filter(
+					$packages,
+					function ( Package $package ) {
+						return Package::STATUS_WARNING === $package->status();
+					}
+				)
+			),
+			'blueprint' => null,
+			'bundle'    => null,
+		);
+
+		$this->warn_leftovers( $site, $json );
+		$summary['ignored'] = count( Inventory::leftovers() );
+
+		if ( ! $json && $report ) {
+			WP_CLI::log( '' );
+			Report::table( $packages );
+			Report::details( $packages );
+		} elseif ( ! $json ) {
+			// --no-report hides the table and the lists, never a problem: errors and warnings still say what and where.
+			Report::details(
+				array_values(
+					array_filter(
+						$packages,
+						function ( Package $package ) {
+							return Package::STATUS_OK !== $package->status();
+						}
+					)
+				)
+			);
+		}
+
+		if ( $errors ) {
+			if ( $json ) {
+				Report::json( $packages, $kept->all(), $summary );
+			} elseif ( $report ) {
+				Report::kept( $kept->all() );
+			}
+			$labels = implode(
+				', ',
+				array_map(
+					function ( Package $package ) {
+						return $package->label();
+					},
+					$errors
+				)
+			);
+			WP_CLI::error( count( $errors ) . " package(s) failed verification ({$labels}). Nothing was changed. Restore the originals, or keep them in the repo with --keep-plugins/--keep-themes." );
+		}
+
+		$writer = new Blueprint( $site, $vendor, (bool) Utils\get_flag_value( $assoc_args, 'activate-with-hooks', false ) );
+		$ci     = null;
+		if ( $pipeline ) {
+			$ci = new Pipeline(
+				$site,
+				$assoc_args['git-provider'],
+				Utils\get_flag_value( $assoc_args, 'deploy-branch', 'main' ),
+				Utils\get_flag_value( $assoc_args, 'deploy-delete', 'mirror' ),
+				$vendor,
+				Utils\get_flag_value( $assoc_args, 'overwrite-ci', false ),
+				Utils\get_flag_value( $assoc_args, 'staging-branch', 'staging' )
+			);
+			$ci->protect( $known->protected_paths() );
+		}
+		$summary['pipeline'] = null;
+		$summary['git']      = null;
+		$in_bundle           = null;
+		$external_dirs       = array();
+		foreach ( $packages as $package ) {
+			if ( Package::SOURCE_EXTERNAL === $package->source ) {
+				$external_dirs[] = $package->path;
+			}
+		}
+		$published = array();
+
+		if ( $bundled ) {
+			$target = true === $bundle_arg || 'true' === $bundle_arg ? Bundle::default_target( $site ) : (string) $bundle_arg;
+			if ( ! Utils\is_path_absolute( $target ) ) {
+				$target = $site->root . $target;
+			}
+			if ( file_exists( $target ) ) {
+				$target = rtrim( (string) realpath( $target ), '/' );
+			}
+			$dir_bundle = '.zip' !== strtolower( substr( $target, -4 ) );
+			Bundle::check_target( $target );
+			if ( '' !== $origin && $use_git && $dir_bundle ) {
+				Git::use_origin( $target, $origin, $log );
+			}
+			$git_for_bundle = $use_git && $dir_bundle;
+			// With git the external packages are published from their folders: no zips in the bundle.
+			$in_bundle = $this->bundle( $site, $core, $plugins, $themes, $kept, $writer, $ci, $vendor, $target, $log, $summary, $progress, $assoc_args, ! $git_for_bundle );
+			if ( $git_for_bundle ) {
+				$summary['git'] = Git::prepare( $target, $deploy_branch, $vendor, $log, $git_branch, $external_dirs );
+			} elseif ( $use_git ) {
+				$log( 'Git: skipped for a zip bundle (use --bundle=<directory> to get a repository ready to push).' );
+			}
+		} else {
+			$output = Utils\get_flag_value( $assoc_args, 'output', 'blueprint.json' );
+			if ( ! Utils\is_path_absolute( $output ) ) {
+				$output = $site->root . $output;
+			}
+			$writer->write( $writer->build( $core, $plugins, $themes ), $output );
+			$summary['blueprint'] = $output;
+			$log( '' );
+			$log( 'Blueprint written to ' . $site->relative( $output ) . '.' );
+
+			if ( $ci ) {
+				$summary['pipeline'] = $ci->write();
+				foreach ( $summary['pipeline'] as $path => $state ) {
+					$written = 0 === strpos( $state, 'written' );
+					$reason  = 'pipeline: rebuilds from the blueprint and deploys (commit it)' . ( 'written' === $state ? '' : ' (replaced: git has the previous version)' );
+					$kept->add( $path, $written ? $reason : "pipeline: {$state}" );
+				}
+				$log( 'Pipeline (' . $assoc_args['git-provider'] . ') written: ' . implode( ', ', array_keys( $summary['pipeline'] ) ) . '.' );
+			}
+
+			// .gitignore whitelists the site's own code, including files a package does not ship.
+			$own = $kept->code();
+			foreach ( $packages as $package ) {
+				if ( Package::SOURCE_ORG === $package->source ) {
+					$base = $site->relative( $package->path );
+					foreach ( $package->added as $file ) {
+						$own[] = ( '' === $base ? '' : $base . '/' ) . $file;
+					}
+				}
+			}
+			$is_dir = function ( $path ) use ( $site ) {
+				return is_dir( $site->root . $path );
+			};
+			// A temporary file of an interrupted transfer inside a folder of the site's own code: never committed.
+			foreach ( $kept->code() as $path ) {
+				if ( is_dir( $site->root . $path ) ) {
+					Inventory::files( $site->root . $path );
+				}
+			}
+			$ignore = array();
+			foreach ( Inventory::leftovers() as $leftover ) {
+				$relative = $site->relative( $leftover );
+				foreach ( $own as $path ) {
+					if ( $relative === $path || 0 === strpos( $relative, rtrim( $path, '/' ) . '/' ) ) {
+						$ignore[] = $relative;
+						break;
+					}
+				}
+			}
+			$info = $this->readme_info( $site, $core, $packages, $own, $ci, $assoc_args );
+			$repo = Repository::files( $own, $ci ? $ci->ci_file() : null, $is_dir, $info, $ignore );
+			foreach ( Repository::write( $site, $repo, Utils\get_flag_value( $assoc_args, 'overwrite-ci', false ) ) as $path => $state ) {
+				$written = 0 === strpos( $state, 'written' );
+				$reason  = 'repository: commit it' . ( 'written' === $state ? '' : ' (replaced: git has the previous version)' );
+				$kept->add( $path, $written ? $reason : "repository: {$state}" );
+			}
+
+			// Before --apply deletes the packages' folders: they are published from there.
+			if ( $use_git ) {
+				$summary['git'] = Git::prepare( rtrim( $site->root, '/' ), $deploy_branch, $vendor, $log, $git_branch, $external_dirs );
+				$published      = $summary['git']['published'];
+			}
+
+			if ( $apply ) {
+				$summary['applied'] = true;
+				$this->apply( $site, $core, $plugins, $themes, $skip_core, $vendor, $assoc_args, $kept, $log, $published );
+			}
+		}
+
+		$this->warn_leftovers( $site, $json );
+		$summary['ignored'] = count( Inventory::leftovers() );
+		if ( $json ) {
+			Report::json( $packages, $kept->all(), $summary );
+			return;
+		}
+
+		if ( $report ) {
+			Report::kept( $kept->all(), $in_bundle );
+			WP_CLI::log( '' );
+		}
+		$counts = array_count_values(
+			array_map(
+				function ( Package $package ) {
+					return $package->source;
+				},
+				$packages
+			)
+		);
+		$line   = sprintf(
+			'%d from wordpress.org, %d external, %d custom; %d warning(s).',
+			isset( $counts[ Package::SOURCE_ORG ] ) ? $counts[ Package::SOURCE_ORG ] : 0,
+			isset( $counts[ Package::SOURCE_EXTERNAL ] ) ? $counts[ Package::SOURCE_EXTERNAL ] : 0,
+			isset( $counts[ Package::SOURCE_CUSTOM ] ) ? $counts[ Package::SOURCE_CUSTOM ] : 0,
+			$summary['warnings']
+		);
+		if ( $summary['ignored'] ) {
+			$line = rtrim( $line, '.' ) . sprintf( '; %d temporary file(s) ignored.', $summary['ignored'] );
+		}
+		Git::print_instructions( $summary['git'], $log );
+		WP_CLI::log( '' );
+		if ( $bundled ) {
+			WP_CLI::success( 'Bundle written to ' . $site->relative( $summary['bundle'] ) . " ({$summary['bundle_files']} files). The site was not changed. " . $line );
+		} elseif ( $apply ) {
+			WP_CLI::success( 'Ejected. ' . $line );
+		} else {
+			WP_CLI::success( 'Dry run, nothing deleted. ' . $line . ' Run again with --apply to eject.' );
+		}
+	}
+
+	/** @var array<string,bool> Temporary files already warned about. */
+	private $reported_leftovers = array();
+
+	/** One warning for each temporary file of an interrupted transfer (rsync) that was left out. */
+	private function warn_leftovers( Site $site, $json ) {
+		foreach ( Inventory::leftovers() as $path ) {
+			if ( isset( $this->reported_leftovers[ $path ] ) ) {
+				continue;
+			}
+			$this->reported_leftovers[ $path ] = true;
+			if ( ! $json ) {
+				WP_CLI::warning( $site->relative( $path ) . ': temporary file of an interrupted transfer (rsync): ignored (not kept, not bundled, not committed). Delete it.' );
+			}
+		}
+	}
+
+	/** The git-prefixed names are the ones documented; the code reads the old keys. */
+	private static function branch_aliases( array $assoc_args ) {
+		foreach ( array(
+			'git-deploy-branch'  => 'deploy-branch',
+			'git-staging-branch' => 'staging-branch',
+			'git-work-branch'    => 'git-branch',
+		) as $new => $old ) {
+			if ( isset( $assoc_args[ $new ] ) ) {
+				$assoc_args[ $old ] = $assoc_args[ $new ];
+			}
+		}
+		return $assoc_args;
+	}
+
+	/**
+	 * --git-deploy-branch defaults to the branch the repository already uses (origin's HEAD, the
+	 * branch checked out), so trunk stays trunk and master stays master; main for a new one.
+	 *
+	 * @param string|bool|null $bundle_arg The --bundle value; false for the site itself.
+	 */
+	private function with_default_branches( array $assoc_args, $bundle_arg ) {
+		if ( isset( $assoc_args['deploy-branch'] ) || ! Requirements::has( 'git' ) ) {
+			return $assoc_args;
+		}
+		$root = rtrim( ABSPATH, '/' );
+		$dir  = $root;
+		if ( is_string( $bundle_arg ) && 'true' !== $bundle_arg ) {
+			$dir = Utils\is_path_absolute( $bundle_arg ) ? $bundle_arg : $root . '/' . $bundle_arg;
+		} elseif ( true === $bundle_arg || 'true' === $bundle_arg ) {
+			$dir = '';
+		}
+		$assoc_args['deploy-branch'] = '' === $dir || '.zip' === strtolower( substr( $dir, -4 ) ) ? 'main' : Git::default_branch( $dir );
+		return $assoc_args;
+	}
+
+	/** --update-deploy: new deploy files for a repository that was ejected before. */
+	private function update_deploy( $assoc_args ) {
+		Requirements::require_zip();
+		$assoc_args = $this->with_default_branches( $assoc_args, false );
+		$provider   = (string) Utils\get_flag_value( $assoc_args, 'git-provider', '' );
+		Pipeline::validate(
+			$provider,
+			(string) Utils\get_flag_value( $assoc_args, 'deploy-branch', 'main' ),
+			(string) Utils\get_flag_value( $assoc_args, 'deploy-delete', 'mirror' ),
+			(string) Utils\get_flag_value( $assoc_args, 'staging-branch', 'staging' )
+		);
+		$root = rtrim( ABSPATH, '/' );
+		if ( ! is_file( $root . '/blueprint.json' ) ) {
+			WP_CLI::error( "No blueprint.json in {$root}: run it in the ejected repository (or give WP-CLI's --path)." );
+		}
+
+		$vendor = Utils\get_flag_value( $assoc_args, 'vendor-path', 'vendor' );
+		$result = array();
+		if ( Blueprint::migrate( $root . '/blueprint.json' ) ) {
+			$result['blueprint.json'] = 'written (removed meta: Playground requires meta.author)';
+		}
+		if ( is_file( $root . '/deploy/deployignore' ) && Pipeline::strip_legacy_header( $root . '/deploy/deployignore' ) ) {
+			$result['deploy/deployignore'] = 'written (removed the "generated" header; the rest is yours)';
+		}
+		$site = Site::from_root( $root );
+		Git::snapshot( $root );
+		$code     = Existing::code_paths( $root );
+		$packages = Existing::packages( $root, $code );
+		$ci       = new Pipeline(
+			$site,
+			$provider,
+			Utils\get_flag_value( $assoc_args, 'deploy-branch', 'main' ),
+			Utils\get_flag_value( $assoc_args, 'deploy-delete', 'mirror' ),
+			$vendor,
+			Utils\get_flag_value( $assoc_args, 'overwrite-ci', false ),
+			Utils\get_flag_value( $assoc_args, 'staging-branch', 'staging' )
+		);
+		$is_dir   = function ( $path ) use ( $site ) {
+			return is_dir( $site->root . $path );
+		};
+		$info     = $this->readme_info( $site, $packages[0], $packages, $code, $ci, $assoc_args );
+		$result  += $ci->write();
+		$result  += Repository::write( $site, Repository::files( $code, $ci->ci_file(), $is_dir, $info ), Utils\get_flag_value( $assoc_args, 'overwrite-ci', false ) );
+		foreach ( $result as $path => $state ) {
+			WP_CLI::log( sprintf( '%-34s %s', $path, $state ) );
+		}
+		WP_CLI::success( 'Deploy files updated. deploy/config.yml and deploy/deployignore are yours and were not touched.' );
+	}
+
+	/**
+	 * Data for the README.md of the repository.
+	 *
+	 * @param Package[] $packages Core, plugins and themes.
+	 * @param string[]  $code     The site's own code (paths).
+	 * @param Pipeline|null $ci
+	 * @return array<string,mixed>
+	 */
+	private function readme_info( Site $site, Package $core, array $packages, array $code, $ci, $assoc_args ) {
+		$rows      = array();
+		$externals = array();
+		$counts    = array(
+			Package::SOURCE_ORG      => 0,
+			Package::SOURCE_EXTERNAL => 0,
+			Package::SOURCE_CUSTOM   => 0,
+		);
+		foreach ( $packages as $package ) {
+			if ( Package::TYPE_CORE === $package->type ) {
+				$rows[] = array(
+					'type'    => 'core',
+					'slug'    => 'wordpress',
+					'version' => $package->version,
+					'source'  => 'wordpress.org',
+				);
+				continue;
+			}
+			++$counts[ $package->source ];
+			if ( Package::SOURCE_EXTERNAL === $package->source ) {
+				$source      = "external: branch `vendor/{$package->type}/{$package->slug}`";
+				$externals[] = array(
+					'type'    => $package->type,
+					'slug'    => $package->slug,
+					'version' => $package->version,
+				);
+			} elseif ( Package::SOURCE_CUSTOM === $package->source ) {
+				$source = 'this repository';
+			} else {
+				$source = 'wordpress.org';
+			}
+			$rows[] = array(
+				'type'    => $package->type,
+				'slug'    => $package->slug,
+				'version' => $package->version,
+				'source'  => $source,
+			);
+		}
+		$code = array_values( array_unique( $code ) );
+		sort( $code );
+		return array(
+			'site'           => basename( rtrim( $site->root, '/' ) ),
+			'wp_version'     => $core->version,
+			'php_version'    => $site->php_version,
+			'count_org'      => $counts[ Package::SOURCE_ORG ] + 1,
+			'count_external' => $counts[ Package::SOURCE_EXTERNAL ],
+			'count_custom'   => $counts[ Package::SOURCE_CUSTOM ],
+			'packages'       => $rows,
+			'externals'      => $externals,
+			'has_code'       => (bool) $code,
+			'code_paths'     => $code,
+			'provider'       => $ci ? Pipeline::NAMES[ $ci->provider() ] : '',
+			'ci_file'        => $ci ? $ci->ci_file() : '',
+			'deploy_branch'  => Utils\get_flag_value( $assoc_args, 'deploy-branch', 'main' ),
+			'staging_branch' => Utils\get_flag_value( $assoc_args, 'staging-branch', 'staging' ),
+		);
+	}
+
+	/**
+	 * Writes the blueprint bundle. The site is only read.
+	 *
+	 * @param Package[] $plugins
+	 * @param Package[] $themes
+	 * @return array<string,bool> Not-ejected paths that are in the bundle (for the report).
+	 */
+	private function bundle( Site $site, Package $core, array $plugins, array $themes, Kept $kept, Blueprint $writer, $ci, $vendor, $target, $log, array &$summary, $progress, $assoc_args, $write_zips ) {
+		$bundle    = new Bundle( $target );
+		$packer    = new Packer( $site, $vendor );
+		$in_bundle = array();
+
+		// The site's own code, at the same paths as in the site.
+		$before = array();
+		foreach ( $kept->code() as $path ) {
+			$before             = array_merge( $before, $bundle->add_tree( $site->root . $path, $path ) );
+			$in_bundle[ $path ] = true;
+		}
+
+		// Files a wordpress.org package does not ship: written after its install.
+		$after = array();
+		foreach ( array_merge( array( $core ), array_values( $plugins ), array_values( $themes ) ) as $package ) {
+			if ( Package::SOURCE_ORG !== $package->source || ! $package->added ) {
+				continue;
+			}
+			$base = $site->relative( $package->path );
+			foreach ( $package->added as $file ) {
+				$relative = ( '' === $base ? '' : $base . '/' ) . $file;
+				if ( is_file( $site->root . $relative ) && ! is_link( $site->root . $relative ) ) {
+					$bundle->add_file( $site->root . $relative, $relative );
+					$after[] = $relative;
+				}
+			}
+			$in_bundle[ ( '' === $base ? '(core)' : $base ) . ' (' . count( $package->added ) . ' added file(s))' ] = true;
+		}
+
+		// External packages, as zips where the blueprint expects them.
+		$zips = array();
+		foreach ( array_merge( array_values( $plugins ), array_values( $themes ) ) as $package ) {
+			if ( Package::SOURCE_EXTERNAL === $package->source && ! $write_zips ) {
+				$kept->add( $site->relative( $package->path ), "external package: published on branch vendor/{$package->type}/{$package->slug}, tag {$package->version} (not in the bundle)" );
+			} elseif ( Package::SOURCE_EXTERNAL === $package->source ) {
+				$relative = trim( $vendor, '/' ) . '/' . $package->type . 's/' . $package->zip_name();
+				$packer->zip_to( $package, $bundle->path( $relative ) );
+				$bundle->counted();
+				$zips[] = $relative;
+				$kept->add( $relative, "external package {$package->slug} {$package->version} (not in the wordpress.org directory)" );
+				$in_bundle[ $relative ] = true;
+				$progress( "Packed {$package->label()} into {$relative}." );
+			}
+		}
+
+		$blueprint = $writer->build( $core, $plugins, $themes, $before, $after );
+		$bundle->add_string( 'blueprint.json', Blueprint::json( $blueprint ) );
+		$is_dir = function ( $path ) use ( $site ) {
+			return is_dir( $site->root . $path );
+		};
+		$info   = $this->readme_info( $site, $core, array_merge( array( $core ), array_values( $plugins ), array_values( $themes ) ), array_merge( $kept->code(), $after ), $ci, $assoc_args );
+		foreach ( Repository::files( array_merge( $kept->code(), $after ), $ci ? $ci->ci_file() : null, $is_dir, $info ) as $path => $content ) {
+			$bundle->add_string( $path, $content );
+			$kept->add( $path, 'repository: commit it' );
+			$in_bundle[ $path ] = true;
+		}
+
+		if ( $ci ) {
+			$summary['pipeline'] = $ci->add_to( $bundle );
+			foreach ( array_keys( $summary['pipeline'] ) as $path ) {
+				$kept->add( $path, 'pipeline: rebuilds from the blueprint and deploys (commit it)' );
+				$in_bundle[ $path ] = true;
+			}
+		}
+		$bundle->close();
+		$summary['bundle']       = $bundle->target();
+		$summary['bundle_files'] = $bundle->count();
+		$summary['blueprint']    = $bundle->target() . ( $bundle->is_zip() ? '#' : '/' ) . 'blueprint.json';
+		$log( '' );
+		$log( 'Bundle written to ' . $site->relative( $bundle->target() ) . ' (' . $bundle->count() . ' files). The site was not changed.' );
+		if ( $bundle->is_zip() ) {
+			$log( 'Run it: npx @wp-playground/cli@latest server --blueprint=' . $site->relative( $bundle->target() ) );
+		}
+		return $in_bundle;
+	}
+
+	private function apply( Site $site, Package $core, array $plugins, array $themes, $skip_core, $vendor, $assoc_args, Kept $kept, $log, array $published = array() ) {
+		$studio = is_file( $site->content_dir . '/mu-plugins/99-studio-loader.php' );
+		$prompt = 'Delete the verified files and pack the external packages?';
+		if ( ! $skip_core ) {
+			$prompt .= $studio
+				? ' Core will be deleted too: this Studio site will not boot until it is rebuilt from the blueprint.'
+				: ' Core will be deleted too: the site will not run until it is rebuilt from the blueprint.';
+		}
+		WP_CLI::confirm( $prompt, $assoc_args );
+
+		$packer  = new Packer( $site, $vendor );
+		$zips    = array(
+			'plugin' => array(),
+			'theme'  => array(),
+		);
+		$deleted = 0;
+
+		foreach ( array_merge( array_values( $plugins ), array_values( $themes ) ) as $package ) {
+			$key = "{$package->type}/{$package->slug}/{$package->version}";
+			if ( Package::SOURCE_EXTERNAL === $package->source && isset( $published[ $key ] ) ) {
+				// On its branch and tag already: the folder can go, no zip needed.
+				$packer->remove_package( $package );
+				$log( "Published {$package->label()} as branch vendor/{$package->type}/{$package->slug} (tag {$package->version}); folder removed." );
+			} elseif ( Package::SOURCE_EXTERNAL === $package->source ) {
+				$zip                      = $packer->pack( $package );
+				$zips[ $package->type ][] = $zip;
+				$log( "Packed {$package->label()} into " . $site->relative( $zip ) . '.' );
+			} elseif ( Package::SOURCE_ORG === $package->source ) {
+				$deleted += $packer->eject( $package );
+			}
+		}
+
+		$all_zips = array_merge( $zips['plugin'], $zips['theme'] );
+		if ( $all_zips ) {
+			$md = $packer->write_instructions( $site->content_dir, array_map( array( $site, 'relative' ), $all_zips ) );
+			$kept->add( $site->relative( $md ), 'instructions: publish the external packages with `vendor publish`' );
+			foreach ( $all_zips as $file ) {
+				$kept->add( $site->relative( $file ), 'external package: publish it as its own branch and tag (see EJECT.md)' );
+			}
+		}
+
+		if ( ! $skip_core && Package::SOURCE_ORG === $core->source ) {
+			$deleted += $packer->eject( $core, array( 'wp-admin', 'wp-includes' ) );
+			foreach ( ( new Inventory( $site ) )->loose_plugins() as $file ) {
+				if ( Core::bundled_file_matches( $site->plugins_dir . '/' . $file, 'plugins/' . $file ) && unlink( $site->plugins_dir . '/' . $file ) ) {
+					++$deleted;
+				}
+			}
+			// The "Silence is golden" index.php files core ships in wp-content: the build recreates them.
+			$silence = array(
+				'index.php'         => $site->content_dir . '/index.php',
+				'plugins/index.php' => $site->plugins_dir . '/index.php',
+				'themes/index.php'  => $site->themes_dir . '/index.php',
+			);
+			foreach ( $silence as $relative => $file ) {
+				if ( Core::bundled_file_matches( $file, $relative ) && unlink( $file ) ) {
+					++$deleted;
+				}
+			}
+		}
+
+		// Regenerable server data: no use locally nor in staging, never versioned or deployed.
+		foreach ( Kept::REGENERABLE as $name ) {
+			$dir = $site->content_dir . '/' . $name;
+			if ( is_dir( $dir ) ) {
+				Packer::remove_dir( $dir );
+				$kept->add( $site->relative( $dir ), 'regenerable server data: deleted (never versioned or deployed)' );
+			}
+		}
+		Packer::prune_empty( $site->content_dir );
+
+		$log( "Deleted {$deleted} verified file(s)." );
+
+		// Plugins' shutdown hooks would now autoload files that no longer exist.
+		if ( $site->has_db && function_exists( 'remove_all_actions' ) ) {
+			remove_all_actions( 'shutdown' );
+		}
+	}
+
+	/**
+	 * @param Package[] $packages
+	 * @param string[]  $slugs
+	 */
+	private function mark_custom( array $packages, array $slugs, $type ) {
+		foreach ( $slugs as $slug ) {
+			if ( ! isset( $packages[ $slug ] ) ) {
+				WP_CLI::warning( "--keep-{$type}s={$slug}: no such {$type}." );
+				continue;
+			}
+			$packages[ $slug ]->source = Package::SOURCE_CUSTOM;
+		}
+	}
+
+	/**
+	 * --known files: as given (relative to the current folder), or relative to
+	 * the site root.
+	 *
+	 * @return string[]
+	 */
+	private static function known_files( $assoc_args, Site $site ) {
+		$files = array();
+		foreach ( array_filter( array_map( 'trim', explode( ',', (string) Utils\get_flag_value( $assoc_args, 'known', '' ) ) ) ) as $file ) {
+			$files[] = ( ! Utils\is_path_absolute( $file ) && ! file_exists( $file ) ) ? $site->root . $file : $file;
+		}
+		return $files;
+	}
+
+	/** --keep-plugins / --keep-themes, comma-separated. */
+	private static function slugs( $assoc_args, $type ) {
+		$value = (string) Utils\get_flag_value( $assoc_args, "keep-{$type}s", '' );
+		return array_values( array_unique( array_filter( array_map( 'trim', explode( ',', $value ) ) ) ) );
+	}
+}

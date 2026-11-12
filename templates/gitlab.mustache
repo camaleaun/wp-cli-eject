@@ -1,0 +1,163 @@
+{{! TODO: no visible credit and no 'generated' text on purpose, see Pipeline::is_generated() (src/Pipeline.php): an option may add one back. }}
+# =============================================================================
+# GITLAB CI/CD - WORDPRESS DEPLOYMENT
+# =============================================================================
+# The site's code is rebuilt from blueprint.json (WordPress Playground) and
+# deployed over SSH by WP-CLI commands in deploy/deploy.php (see deploy/README.md):
+#   - wp --require=deploy/deploy.php build        : blueprint -> build/ (+ the repository's own code)
+#   - wp --require=deploy/deploy.php deploy       : build/ -> server (maintenance, backup, after commands)
+#   - wp --require=deploy/deploy.php maintenance  : maintenance mode on/off
+# Settings: deploy/config.yml. Never deployed nor deleted: deploy/deployignore.
+#
+# Variables (Settings > CI/CD > Variables, scoped to the "production" and
+# "staging" environments):
+#   - SSH_PRIVATE_KEY (masked), SSH_HOST, SSH_USER, DEPLOY_PATH
+#   - optional: SSH_PORT, SSH_KNOWN_HOSTS, DEPLOY_DELETE, DEPLOY_STRATEGY, SLACK_WEBHOOK_URL
+# Unscoped variables may use the STAGING_ prefix for staging (STAGING_SSH_HOST…).
+# =============================================================================
+
+image: node:22
+
+variables:
+  # The artifact between the jobs is build/ (a local build lives outside the repository)
+  BUILD_DIR: build
+
+stages:
+  - build
+  - deploy
+  - maintenance
+
+# =============================================================================
+# DEFINITIONS
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# TOOLS: PHP + WP-CLI run deploy/deploy.php; Node runs the Playground CLI
+# -----------------------------------------------------------------------------
+.tools: &tools
+  - apt-get update -qq && apt-get install -y -qq php-cli php-zip rsync openssh-client > /dev/null
+  - curl -sSLo /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x /usr/local/bin/wp
+
+# -----------------------------------------------------------------------------
+# BUILD STEP
+# -----------------------------------------------------------------------------
+.build: &build
+  stage: build
+  cache:
+    key: npm
+    paths:
+      - .npm/
+  before_script:
+    - *tools
+    - npm config set cache "$CI_PROJECT_DIR/.npm"
+  script:
+    # Rebuild the site's code into build/
+    - wp --require=deploy/deploy.php build
+  artifacts:
+    paths:
+      - build/
+    expire_in: 1 day
+
+# -----------------------------------------------------------------------------
+# DEPLOY STEP
+# -----------------------------------------------------------------------------
+.deploy: &deploy
+  stage: deploy
+  before_script:
+    - *tools
+  script:
+    # Run deployment (DEPLOY_ENV is the environment's name)
+    - wp --require=deploy/deploy.php deploy --env="$DEPLOY_ENV"
+
+# -----------------------------------------------------------------------------
+# MAINTENANCE STEP (manual)
+# -----------------------------------------------------------------------------
+.maintenance: &maintenance
+  stage: maintenance
+  needs: []
+  before_script:
+    - *tools
+  script:
+    - wp --require=deploy/deploy.php maintenance "$MAINTENANCE" --env="$DEPLOY_ENV"
+
+# =============================================================================
+# PIPELINE TRIGGERS
+# =============================================================================
+
+# Build (deploy branches, and merge requests to validate the blueprint)
+build:
+  <<: *build
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "{{{branch}}}" || $CI_COMMIT_BRANCH == "{{{staging_branch}}}"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+# Production deployment ({{{branch}}} branch)
+deploy-production:
+  <<: *deploy
+  needs:
+    - build
+  environment: production
+  resource_group: production
+  variables:
+    DEPLOY_ENV: production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "{{{branch}}}"'
+
+# Staging deployment ({{{staging_branch}}} branch)
+deploy-staging:
+  <<: *deploy
+  needs:
+    - build
+  environment: staging
+  resource_group: staging
+  variables:
+    DEPLOY_ENV: staging
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "{{{staging_branch}}}"'
+
+# -----------------------------------------------------------------------------
+# MANUAL JOBS (Build > Pipelines > the pipeline > play)
+# -----------------------------------------------------------------------------
+maintenance-on-production:
+  <<: *maintenance
+  environment: production
+  variables:
+    DEPLOY_ENV: production
+    MAINTENANCE: "on"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "{{{branch}}}"'
+      when: manual
+      allow_failure: true
+
+maintenance-off-production:
+  <<: *maintenance
+  environment: production
+  variables:
+    DEPLOY_ENV: production
+    MAINTENANCE: "off"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "{{{branch}}}"'
+      when: manual
+      allow_failure: true
+
+maintenance-on-staging:
+  <<: *maintenance
+  environment: staging
+  variables:
+    DEPLOY_ENV: staging
+    MAINTENANCE: "on"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "{{{staging_branch}}}"'
+      when: manual
+      allow_failure: true
+
+maintenance-off-staging:
+  <<: *maintenance
+  environment: staging
+  variables:
+    DEPLOY_ENV: staging
+    MAINTENANCE: "off"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "{{{staging_branch}}}"'
+      when: manual
+      allow_failure: true

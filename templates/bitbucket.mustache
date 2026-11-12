@@ -1,0 +1,156 @@
+{{! TODO: no visible credit and no 'generated' text on purpose, see Pipeline::is_generated() (src/Pipeline.php): an option may add one back. }}
+# =============================================================================
+# BITBUCKET PIPELINES - WORDPRESS DEPLOYMENT
+# =============================================================================
+# The site's code is rebuilt from blueprint.json (WordPress Playground) and
+# deployed over SSH by WP-CLI commands in deploy/deploy.php (see deploy/README.md):
+#   - wp --require=deploy/deploy.php build        : blueprint -> build/ (+ the repository's own code)
+#   - wp --require=deploy/deploy.php deploy       : build/ -> server (maintenance, backup, after commands)
+#   - wp --require=deploy/deploy.php maintenance  : maintenance mode on/off
+# Settings: deploy/config.yml. Never deployed nor deleted: deploy/deployignore.
+#
+# SSH key (one of):
+#   - Repository settings > Pipelines > SSH keys (recommended; found by itself), or
+#   - SSH_PRIVATE_KEY (secured variable), or SSH_KEY_PATH
+#
+# Deployment variables (Repository settings > Deployments > Production / Staging):
+#   - SSH_HOST, SSH_USER, DEPLOY_PATH
+#   - optional: SSH_PORT, SSH_KNOWN_HOSTS, DEPLOY_DELETE, DEPLOY_STRATEGY, SLACK_WEBHOOK_URL
+# As repository variables, staging may use the STAGING_ prefix (STAGING_SSH_HOST…),
+# which falls back to the production name.
+# =============================================================================
+
+image: node:22
+
+definitions:
+  caches:
+    npm: ~/.npm
+
+  steps:
+    # -------------------------------------------------------------------------
+    # BUILD STEP
+    # -------------------------------------------------------------------------
+    - step: &build
+        name: Build from the blueprint
+        caches:
+          - npm
+        script:
+          # Install required tools (PHP + WP-CLI run deploy/deploy.php; Node runs the Playground CLI)
+          - apt-get update -qq && apt-get install -y -qq php-cli php-zip rsync > /dev/null
+          - curl -sSLo /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x /usr/local/bin/wp
+
+          # Rebuild the site's code into build/
+          - export BUILD_DIR=build
+          - wp --require=deploy/deploy.php build
+        artifacts:
+          - build/**
+
+    # -------------------------------------------------------------------------
+    # DEPLOY TO PRODUCTION
+    # -------------------------------------------------------------------------
+    - step: &deploy-production
+        name: Deploy to Production
+        deployment: production
+        script:
+          # Install required tools
+          - apt-get update -qq && apt-get install -y -qq php-cli php-zip rsync openssh-client > /dev/null
+          - curl -sSLo /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x /usr/local/bin/wp
+
+          # Run deployment
+          - export BUILD_DIR=build
+          - wp --require=deploy/deploy.php deploy --env=production
+
+    # -------------------------------------------------------------------------
+    # DEPLOY TO STAGING
+    # -------------------------------------------------------------------------
+    - step: &deploy-staging
+        name: Deploy to Staging
+        deployment: staging
+        script:
+          # Install required tools
+          - apt-get update -qq && apt-get install -y -qq php-cli php-zip rsync openssh-client > /dev/null
+          - curl -sSLo /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x /usr/local/bin/wp
+
+          # Run deployment (STAGING_* variables fall back to the production ones)
+          - export BUILD_DIR=build
+          - wp --require=deploy/deploy.php deploy --env=staging
+
+# =============================================================================
+# PIPELINE TRIGGERS
+# =============================================================================
+pipelines:
+  branches:
+    # Production deployment ({{{branch}}} branch)
+    {{{branch}}}:
+      - step: *build
+      - step: *deploy-production
+
+    # Staging deployment ({{{staging_branch}}} branch)
+    {{{staging_branch}}}:
+      - step: *build
+      - step: *deploy-staging
+
+  # ---------------------------------------------------------------------------
+  # MANUAL PIPELINES (Trigger from Bitbucket UI: Pipelines > Run pipeline)
+  # ---------------------------------------------------------------------------
+  custom:
+    # Full deployment to production
+    deploy-production:
+      - step: *build
+      - step: *deploy-production
+
+    # Full deployment to staging
+    deploy-staging:
+      - step: *build
+      - step: *deploy-staging
+
+    # Build only (no deployment)
+    build-only:
+      - step: *build
+
+    # Maintenance mode controls - Production
+    maintenance-on-production:
+      - step:
+          name: Enable Maintenance Mode (Production)
+          deployment: production
+          script:
+            - apt-get update -qq && apt-get install -y -qq php-cli openssh-client > /dev/null
+            - curl -sSLo /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x /usr/local/bin/wp
+            - wp --require=deploy/deploy.php maintenance on --env=production
+
+    maintenance-off-production:
+      - step:
+          name: Disable Maintenance Mode (Production)
+          deployment: production
+          script:
+            - apt-get update -qq && apt-get install -y -qq php-cli openssh-client > /dev/null
+            - curl -sSLo /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x /usr/local/bin/wp
+            - wp --require=deploy/deploy.php maintenance off --env=production
+
+    # Maintenance mode controls - Staging
+    maintenance-on-staging:
+      - step:
+          name: Enable Maintenance Mode (Staging)
+          deployment: staging
+          script:
+            - apt-get update -qq && apt-get install -y -qq php-cli openssh-client > /dev/null
+            - curl -sSLo /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x /usr/local/bin/wp
+            - wp --require=deploy/deploy.php maintenance on --env=staging
+
+    maintenance-off-staging:
+      - step:
+          name: Disable Maintenance Mode (Staging)
+          deployment: staging
+          script:
+            - apt-get update -qq && apt-get install -y -qq php-cli openssh-client > /dev/null
+            - curl -sSLo /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar && chmod +x /usr/local/bin/wp
+            - wp --require=deploy/deploy.php maintenance off --env=staging
+
+  # ---------------------------------------------------------------------------
+  # PULL REQUEST PIPELINE
+  # ---------------------------------------------------------------------------
+  pull-requests:
+    '**':
+      - step:
+          <<: *build
+          name: Build & Validate

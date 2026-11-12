@@ -1,0 +1,75 @@
+{{! TODO: no visible credit and no 'generated' text on purpose, see Pipeline::is_generated() (src/Pipeline.php): an option may add one back, and a line about regenerating the deploy files could come with it. }}
+# {{{site}}}
+
+The code of this WordPress site. `blueprint.json` rebuilds it (WordPress {{{wp_version}}}, PHP {{{php_version}}}).
+The database, uploads and `wp-config.php` are not here.
+
+| Where it comes from | How many |
+|---|---|
+| wordpress.org (core, plugins, themes, exact versions) | {{{count_org}}} |
+| external (not in wordpress.org: own branch, one tag per version) | {{{count_external}}} |
+| this repository | {{{count_custom}}} package(s){{#has_code}} and the files below{{/has_code}} |
+
+| Type | Package | Version | Source |
+|---|---|---|---|
+{{#packages}}
+| {{{type}}} | `{{{slug}}}` | {{{version}}} | {{{source}}} |
+{{/packages}}
+
+{{#has_code}}
+Own code kept in this repository (the rest of `wp-content/` is ignored):
+
+{{#code_paths}}
+- `{{{.}}}`
+{{/code_paths}}
+
+{{/has_code}}
+## Run it locally
+
+```bash
+wp --require=deploy/deploy.php restore
+```
+
+This builds the site and copies it into this folder. It needs Node.js (`npx`), `rsync` and `git`.
+It never touches `wp-config.php`, the database, `deploy/` or `.git`.
+
+To run the blueprint alone in WordPress Playground:
+
+```bash
+wp --require=deploy/deploy.php vendor fetch
+npx @wp-playground/cli@latest server --blueprint=./blueprint.json --blueprint-may-read-adjacent-files
+```
+
+A rebuild installs the zip wordpress.org serves today. If an author edited a released version
+(a readme, line endings), a file can differ in a harmless way. The published checksums accept both.
+
+{{#provider}}
+## Deploy
+
+Pushes to `{{{deploy_branch}}}` build the site and deploy it to **production**. Pushes to
+`{{{staging_branch}}}` deploy to **staging**. Both go over SSH ({{{provider}}}, `{{{ci_file}}}`).
+Setup, settings and commands: [`deploy/README.md`](deploy/README.md).
+
+{{/provider}}
+## External packages
+
+{{#externals}}
+- `{{{slug}}}` {{{version}}}: branch `vendor/{{{type}}}/{{{slug}}}`, tag `vendor/{{{type}}}/{{{slug}}}/{{{version}}}`
+{{/externals}}
+{{^externals}}
+There are none: everything comes from wordpress.org or from this repository.
+{{/externals}}
+
+Each one lives on its own branch with one tag per version, so git keeps only what changes.
+No zip is committed: `build` makes the zips from the tags.
+
+```bash
+git push origin 'refs/heads/vendor/*' 'refs/tags/vendor/*'      # send them with the repository
+wp --require=deploy/deploy.php vendor list                      # published and pending
+wp --require=deploy/deploy.php vendor publish --no-push         # a new version: folder or zip -> branch + tag
+```
+
+## Updating
+
+- **wordpress.org package or core:** change the version in its URL in `blueprint.json`.
+- **External package:** run `vendor publish`, then point its `bundled` path in `blueprint.json` to the new version's zip.
